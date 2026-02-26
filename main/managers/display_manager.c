@@ -1020,13 +1020,11 @@ static void set_rotation_on_lvgl(void *param) {
     lv_obj_set_width(status_bar, lv_disp_get_hor_res(disp));
   }
 
-  /* Check if the aspect ratio changed (portrait ↔ landscape).
-   * 0°/180° keep the native portrait aspect; 90°/270° swap to landscape. */
-  bool old_landscape = (old_rot == LV_DISP_ROT_90  || old_rot == LV_DISP_ROT_270);
-  bool new_landscape = (rot    == LV_DISP_ROT_90  || rot    == LV_DISP_ROT_270);
-
-  if (old_landscape != new_landscape &&
-      dm.current_view && dm.current_view->root) {
+  /* Rebuild the current view so it picks up the new screen dimensions.
+   * Views size their elements using lv_disp_get_hor/ver_res() at create
+   * time, so they must be destroyed and re-created after any rotation —
+   * not just when the aspect ratio flips. */
+  if (dm.current_view && dm.current_view->root) {
     View *v = dm.current_view;
     if (v->destroy) v->destroy();
     dm.current_view = NULL;
@@ -1037,10 +1035,8 @@ static void set_rotation_on_lvgl(void *param) {
     }
   }
 
-  ESP_LOGI(TAG, "Display rotation set to %d° (aspect %s)",
-           rotation * 90,
-           (old_landscape != new_landscape) ? "changed – view rebuilt"
-                                            : "unchanged");
+  ESP_LOGI(TAG, "Display rotation set to %d° — view rebuilt",
+           rotation * 90);
 }
 
 void display_manager_set_rotation(uint8_t rotation) {

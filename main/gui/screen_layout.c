@@ -6,6 +6,8 @@ lv_obj_t *gui_screen_create_root(lv_obj_t *parent, const char *title, lv_color_t
     if (!parent) parent = lv_scr_act();
 
     lv_obj_t *root = lv_obj_create(parent);
+    lv_obj_remove_style_all(root);            /* strip theme card style */
+    lv_obj_set_pos(root, 0, 0);               /* pin to origin */
     lv_obj_set_size(root, LV_HOR_RES, LV_VER_RES);
     lv_obj_clear_flag(root, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(root, LV_SCROLLBAR_MODE_OFF);
@@ -30,6 +32,7 @@ lv_obj_t *gui_screen_create_content(lv_obj_t *root, lv_coord_t status_bar_h) {
     if (status_bar_h > LV_VER_RES) status_bar_h = LV_VER_RES;
 
     lv_obj_t *content = lv_obj_create(root);
+    lv_obj_remove_style_all(content);          /* strip theme card style */
     lv_obj_set_pos(content, 0, status_bar_h);
     lv_obj_set_size(content, LV_HOR_RES, LV_VER_RES - status_bar_h);
     lv_obj_clear_flag(content, LV_OBJ_FLAG_SCROLLABLE);
