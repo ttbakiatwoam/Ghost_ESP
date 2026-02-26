@@ -5,14 +5,24 @@
 #include <stdbool.h>
 
 // I2C configuration
-#ifdef CONFIG_IDF_TARGET_ESP32S3
+// On Waveshare ESP32-S3 1.8" AMOLED the AXP2101 shares the main I2C bus
+// (SDA=15, SCL=14) at I2C_NUM_0 with CST816T touch and QMI8658 IMU.
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+#define I2C_MASTER_NUM   (I2C_NUM_0)
+#define I2C_MASTER_SDA_IO 15
+#define I2C_MASTER_SCL_IO 14
+#define I2C_MASTER_FREQ_HZ 400000
+#elif defined(CONFIG_IDF_TARGET_ESP32S3)
 #define I2C_MASTER_NUM (I2C_NUM_1) // I2C port number
-#else
-#define I2C_MASTER_NUM (I2C_NUM_0) // I2C port number
-#endif
 #define I2C_MASTER_SDA_IO 10      // SDA pin
 #define I2C_MASTER_SCL_IO 11      // SCL pin
 #define I2C_MASTER_FREQ_HZ 100000 // I2C clock frequency
+#else
+#define I2C_MASTER_NUM (I2C_NUM_0) // I2C port number
+#define I2C_MASTER_SDA_IO 10      // SDA pin
+#define I2C_MASTER_SCL_IO 11      // SCL pin
+#define I2C_MASTER_FREQ_HZ 100000 // I2C clock frequency
+#endif
 #define AXP2101_I2C_ADDR 0x34     // AXP2101 I2C address
 
 /**

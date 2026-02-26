@@ -81,6 +81,13 @@ esp_err_t axp2101_init(void) {
     return ESP_OK;
   }
 
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  // On Waveshare AMOLED the I2C bus is already initialized by display_manager
+  // for the CST816T touch and QMI8658 IMU.  Just mark as ready.
+  i2c_initialized = true;
+  printf("INFO [%s]: AXP2101 using shared I2C bus (already initialized)\n", __func__);
+  return ESP_OK;
+#else
   i2c_config_t conf = {
       .mode = I2C_MODE_MASTER,
       .sda_io_num = I2C_MASTER_SDA_IO,
@@ -108,6 +115,7 @@ esp_err_t axp2101_init(void) {
   i2c_initialized = true;
   printf("INFO [%s]: AXP2101 initialized successfully\n", __func__);
   return ESP_OK;
+#endif
 }
 
 esp_err_t axp2101_deinit(void) {
@@ -116,6 +124,12 @@ esp_err_t axp2101_deinit(void) {
     return ESP_OK;
   }
 
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  // Shared bus — don't tear down I2C, just mark as not initialized
+  i2c_initialized = false;
+  printf("INFO [%s]: AXP2101 deinitialized (shared I2C bus left intact)\n", __func__);
+  return ESP_OK;
+#else
   esp_err_t err = i2c_driver_delete(I2C_MASTER_NUM);
   if (err != ESP_OK) {
     printf("ERROR [%s]: Failed to delete I2C driver: %s\n", __func__,
@@ -126,6 +140,7 @@ esp_err_t axp2101_deinit(void) {
   i2c_initialized = false;
   printf("INFO [%s]: AXP2101 deinitialized successfully\n", __func__);
   return ESP_OK;
+#endif
 }
 
 esp_err_t axp2101_get_power_level(uint8_t *power_level) {
