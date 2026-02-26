@@ -67,6 +67,7 @@ typedef enum {
     SETTING_NAV_BUTTONS,
     SETTING_MENU_LAYOUT,
     SETTING_AUTO_SAVE_SCANS,
+    SETTING_DISPLAY_ROTATION,
 #ifdef CONFIG_WITH_STATUS_DISPLAY
     SETTING_IDLE_ANIMATION,
     SETTING_IDLE_ANIM_DELAY,
@@ -197,6 +198,7 @@ typedef struct {
   bool encoder_invert_direction;
   bool setup_complete;
   bool auto_save_scans;
+  uint8_t display_rotation; // 0=0°, 1=90°, 2=180°, 3=270°
   uint8_t wifi_country;
 
   // Wigle API key for wardriving upload (format: "APIName:APIToken" from wigle.net/account)
@@ -257,6 +259,9 @@ uint8_t settings_get_rgb_speed(const FSettings *settings);
 
 void settings_set_zebra_menus_enabled(FSettings *settings, bool enabled);
 bool settings_get_zebra_menus_enabled(const FSettings *settings);
+
+void settings_set_display_rotation(FSettings *settings, uint8_t rotation);
+uint8_t settings_get_display_rotation(const FSettings *settings);
 
 // Getters and Setters for Evil Portal
 void settings_set_portal_url(FSettings *settings, const char *url);

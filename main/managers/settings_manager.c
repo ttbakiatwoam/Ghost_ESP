@@ -63,6 +63,7 @@ static const char *NVS_NEOPIXEL_MAX_BRIGHTNESS_KEY = "neopixel_bright";
 static const char *NVS_RGB_LED_COUNT_KEY = "rgb_led_cnt";
 static const char *NVS_ENCODER_INVERT_KEY = "enc_inv";
 static const char *NVS_AUTO_SAVE_SCANS_KEY = "auto_save_sc";
+static const char *NVS_DISPLAY_ROTATION_KEY = "disp_rot";
 static const char *NVS_SETUP_COMPLETE_KEY = "setup_done";
 static const char *NVS_WIFI_COUNTRY_KEY = "wifi_country";
 static const char *NVS_WIGLE_API_KEY = "wigle_api_key";
@@ -180,6 +181,7 @@ void settings_set_defaults(FSettings *settings) {
   settings->encoder_invert_direction = false;
   settings->rgb_led_count = CONFIG_NUM_LEDS;
   settings->auto_save_scans = true;
+  settings->display_rotation = 0; // 0=0° (native portrait)
   settings->setup_complete = false;
   settings->wifi_country = 0;
   strcpy(settings->wigle_api_key, "");
@@ -538,6 +540,14 @@ void settings_load(FSettings *settings) {
     settings->auto_save_scans = true; // Default to enabled if not found
   }
 
+  // Load Display Rotation
+  err = nvs_get_u8(nvsHandle, NVS_DISPLAY_ROTATION_KEY, &value_u8);
+  if (err == ESP_OK && value_u8 <= 3) {
+    settings->display_rotation = value_u8;
+  } else {
+    settings->display_rotation = 0; // Default to native portrait (0°)
+  }
+
   // Load Menu Layout
   err = nvs_get_u8(nvsHandle, NVS_MENU_LAYOUT_KEY, &value_u8);
   if (err == ESP_OK) {
@@ -763,6 +773,10 @@ void settings_persist_setting(SettingsType setting) {
             err = nvs_set_u8(nvsHandle, NVS_AUTO_SAVE_SCANS_KEY, G_Settings.auto_save_scans);
             key = NVS_AUTO_SAVE_SCANS_KEY;
             break;
+        case SETTING_DISPLAY_ROTATION:
+            err = nvs_set_u8(nvsHandle, NVS_DISPLAY_ROTATION_KEY, G_Settings.display_rotation);
+            key = NVS_DISPLAY_ROTATION_KEY;
+            break;
         case SETTING_MENU_LAYOUT:
             err = nvs_set_u8(nvsHandle, NVS_MENU_LAYOUT_KEY, G_Settings.menu_layout);
             key = NVS_MENU_LAYOUT_KEY;
@@ -963,6 +977,7 @@ void settings_save(const FSettings *settings) {
     nvs_set_u8(nvsHandle, NVS_INFRARED_EASY_MODE_KEY, settings->infrared_easy_mode ? 1 : 0);
     nvs_set_u8(nvsHandle, NVS_NAV_BUTTONS_KEY, settings->nav_buttons_enabled ? 1 : 0);
     nvs_set_u8(nvsHandle, NVS_AUTO_SAVE_SCANS_KEY, settings->auto_save_scans ? 1 : 0);
+    nvs_set_u8(nvsHandle, NVS_DISPLAY_ROTATION_KEY, settings->display_rotation);
     nvs_set_u8(nvsHandle, NVS_MENU_LAYOUT_KEY, (uint8_t)settings->menu_layout);
     nvs_set_str(nvsHandle, NVS_TIMEZONE_NAME, settings->selected_timezone);
     nvs_set_u8(nvsHandle, NVS_WIFI_COUNTRY_KEY, settings->wifi_country);
@@ -1373,6 +1388,14 @@ void settings_set_auto_save_scans(FSettings *settings, bool enabled) {
 
 bool settings_get_auto_save_scans(const FSettings *settings) {
     return settings->auto_save_scans;
+}
+
+void settings_set_display_rotation(FSettings *settings, uint8_t rotation) {
+    settings->display_rotation = rotation > 4 ? 0 : rotation;
+}
+
+uint8_t settings_get_display_rotation(const FSettings *settings) {
+    return settings->display_rotation;
 }
 
 // Menu layout settings

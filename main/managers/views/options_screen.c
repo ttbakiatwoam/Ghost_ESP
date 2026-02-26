@@ -347,12 +347,15 @@ static const char *brightness_options[] = {
     "10%", "20%", "30%", "40%", "50%", "60%", "70%", "80%", "90%", "100%"
 };
 
+static const char *rotation_options[] = {"0 deg", "90 deg", "180 deg", "270 deg", "Auto"};
+
 static SettingsItem settings_items[] = {
     {"Display Timeout", SETTING_DISPLAY_TIMEOUT, timeout_options, 5, 1, SETTINGS_CAT_DISPLAY, false, NULL},
 #ifdef CONFIG_LV_DISP_BACKLIGHT_PWM
     {"Max Brightness", SETTING_MAX_BRIGHTNESS, brightness_options, 10, 9, SETTINGS_CAT_DISPLAY, false, NULL},
 #endif
     {"Invert Colors", SETTING_INVERT_COLORS, bool_options, 2, 0, SETTINGS_CAT_DISPLAY, false, NULL},
+    {"Screen Rotation", SETTING_DISPLAY_ROTATION, rotation_options, 5, 0, SETTINGS_CAT_DISPLAY, false, NULL},
     
     {"Menu Theme", SETTING_MENU_THEME, theme_options, 15, 0, SETTINGS_CAT_APPEARANCE, false, NULL},
     {"Menu Layout", SETTING_MENU_LAYOUT, menu_layout_options, 3, 0, SETTINGS_CAT_APPEARANCE, false, NULL},
@@ -428,6 +431,9 @@ unsigned long createdTimeInMs = 0;
 static int opt_touch_start_x;
 static int opt_touch_start_y;
 static bool opt_touch_started = false;
+static bool opt_back_primed = false;      /* true when press started inside back_btn */
+static uint32_t last_back_ms = 0;          /* cooldown for back_event_cb */
+#define BACK_BTN_COOLDOWN_MS 400
 #if CONFIG_LV_TOUCH_CONTROLLER_XPT2046
 static const int OPT_SWIPE_THRESHOLD_RATIO = 1;
 #else
@@ -941,6 +947,9 @@ static void load_current_settings_values(void) {
             case SETTING_AUTO_SAVE_SCANS:
                 settings_items[i].current_value = settings_get_auto_save_scans(&G_Settings) ? 1 : 0;
                 break;
+            case SETTING_DISPLAY_ROTATION:
+                settings_items[i].current_value = settings_get_display_rotation(&G_Settings);
+                break;
             case SETTING_MENU_LAYOUT:
             settings_items[i].current_value = settings_get_menu_layout(&G_Settings);
                 break;
@@ -1052,6 +1061,15 @@ static void apply_setting_change(int setting_index, int new_value) {
             break;
         case SETTING_AUTO_SAVE_SCANS:
             settings_set_auto_save_scans(&G_Settings, new_value == 1);
+            break;
+        case SETTING_DISPLAY_ROTATION:
+            settings_set_display_rotation(&G_Settings, (uint8_t)new_value);
+            if (new_value == 4) {
+                display_manager_start_auto_rotation();
+            } else {
+                display_manager_stop_auto_rotation();
+                display_manager_set_rotation((uint8_t)new_value);
+            }
             break;
         case SETTING_MENU_LAYOUT:
             settings_set_menu_layout(&G_Settings, new_value);
@@ -1295,15 +1313,17 @@ void handle_hardware_button_press_options(InputEvent *event) {
                     return;
                 }
             }
+            /* Back button: prime on press, fire on release (see REL block) */
             if (back_btn && lv_obj_is_valid(back_btn)) {
                 lv_area_t area; lv_obj_get_coords(back_btn, &area);
                 if (data->point.x >= area.x1 && data->point.x <= area.x2 &&
                     data->point.y >= area.y1 && data->point.y <= area.y2) {
-                    back_event_cb(NULL);
+                    opt_back_primed = true;
                     opt_touch_started = false;
                     return;
                 }
             }
+            opt_back_primed = false; /* press started outside back_btn */
             if (!opt_touch_started) {
                 opt_touch_started = true;
                 opt_touch_start_x = data->point.x;
@@ -1313,6 +1333,21 @@ void handle_hardware_button_press_options(InputEvent *event) {
         }
 
         if (data->state == LV_INDEV_STATE_REL) {
+            /* Back button fires on release inside the button area */
+            if (opt_back_primed) {
+                opt_back_primed = false;
+                if (back_btn && lv_obj_is_valid(back_btn)) {
+                    lv_area_t area; lv_obj_get_coords(back_btn, &area);
+                    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+                    if (data->point.x >= area.x1 && data->point.x <= area.x2 &&
+                        data->point.y >= area.y1 && data->point.y <= area.y2 &&
+                        (now - last_back_ms) >= BACK_BTN_COOLDOWN_MS) {
+                        last_back_ms = now;
+                        back_event_cb(NULL);
+                    }
+                }
+                return;
+            }
             if (!opt_touch_started) return;
             opt_touch_started = false;
 
