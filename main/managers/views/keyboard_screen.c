@@ -132,6 +132,7 @@ static void destroy_key_buttons(void);
 
 static lv_obj_t *pressed_key_btn = NULL;
 static lv_obj_t *selected_key_btn = NULL;
+static bool kb_touch_active = false; /* guard against repeated PR events per touch */
 static int cursor_row = 0;
 static int cursor_col = 0;
 static lv_timer_t *keyboard_build_timer = NULL;
@@ -928,6 +929,9 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
             apply_selection_highlight();
         }
     } else if (event->type == INPUT_TYPE_TOUCH && event->data.touch_data.state == LV_INDEV_STATE_PR) {
+        /* Only process the first PR event per touch; ignore continued presses */
+        if (kb_touch_active) return;
+        kb_touch_active = true;
         int touch_x = event->data.touch_data.point.x;
         int touch_y = event->data.touch_data.point.y;
         ESP_LOGD(TAG, "touch PR x=%d y=%d", touch_x, touch_y);
@@ -1065,6 +1069,7 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
             }
         }
     } else if (event->type == INPUT_TYPE_TOUCH && event->data.touch_data.state == LV_INDEV_STATE_REL) {
+        kb_touch_active = false;
         if (pressed_key_btn) {
             // Only restore style if not SHIFT key, otherwise let update_key_labels() handle it
             lv_obj_t *key_label = lv_obj_get_child(pressed_key_btn, 0);
