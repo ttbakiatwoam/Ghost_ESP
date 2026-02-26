@@ -49,11 +49,9 @@ list(REMOVE_ITEM app_sources "${CMAKE_SOURCE_DIR}/main/vendor/i80_display.c")
 file(GLOB_RECURSE image_sources "${CMAKE_SOURCE_DIR}/main/vendor/images/*.c")
 file(GLOB_RECURSE axs15231b_sources "${CMAKE_SOURCE_DIR}/components/axs15231b/*.c")
 
-
 list(APPEND app_sources ${axs15231b_sources} ${image_sources})
 
-
-set(required_components bt nvs_flash driver esp_http_server mdns json esp_http_client mbedtls fatfs sdmmc wpa_supplicant lvgl lvgl_esp32_drivers freertos esp_lcd esp_adc esp_timer io_manager usb esp_eth)
+set(required_components bt nvs_flash driver esp_http_server mdns json esp_http_client mbedtls fatfs sdmmc wpa_supplicant lvgl lvgl_esp32_drivers freertos esp_lcd esp_adc esp_timer io_manager usb esp_eth rm67162_qspi cst816t)
 
 # Optionally add extra include directories
 set(extra_includes "")
@@ -61,10 +59,7 @@ if(CONFIG_USE_IO_EXPANDER)
     list(APPEND extra_includes "${CMAKE_SOURCE_DIR}/components/io_manager")
 endif()
 
-
 set(sources ${app_sources})
-
-
 
 ## nfc build control: only include pn532 component/sources when pn532 is enabled
 if(CONFIG_HAS_NFC)
@@ -90,6 +85,9 @@ endif()
 if(CONFIG_USE_IO_EXPANDER)
     list(APPEND required_components io_manager)
 endif()
+
+# Waveshare AMOLED components (rm67162_qspi, cst816t) added unconditionally above
+# because ESP-IDF's first CMake pass has no Kconfig values. C code uses #ifdef guards.
 
 # Add IEEE 802.15.4 component for Zigbee capture on ESP32-C5/C6
 if(idf_target STREQUAL "esp32c5" OR idf_target STREQUAL "esp32c6")

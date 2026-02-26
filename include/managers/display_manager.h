@@ -12,6 +12,9 @@ typedef void *SemaphoreHandle_tt; // Because Circular Includes are fun :)
 // static lv_timer_t *rainbow_timer = NULL; // Removed: moved to implementation file
 // static uint16_t rainbow_hue = 0; // Removed: moved to implementation file
 void display_manager_set_rainbow_mode(bool enable);
+void display_manager_set_rotation(uint8_t rotation);
+void display_manager_start_auto_rotation(void);
+void display_manager_stop_auto_rotation(void);
 
 
 typedef enum {

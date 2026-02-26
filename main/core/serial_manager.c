@@ -116,7 +116,7 @@ void command_history_add(const char* command) {
     if (command == NULL || strlen(command) == 0) {
         return;
     }
-    
+
     // Don't add duplicate consecutive commands
     if (command_history.history_count > 0) {
         int last_index = (command_history.current_index - 1 + MAX_HISTORY_SIZE) % MAX_HISTORY_SIZE;
@@ -124,19 +124,19 @@ void command_history_add(const char* command) {
             return;
         }
     }
-    
+
     // Add command to current position
     strncpy(command_history.commands[command_history.current_index], command, MAX_COMMAND_LENGTH - 1);
     command_history.commands[command_history.current_index][MAX_COMMAND_LENGTH - 1] = '\0';
-    
+
     // Move to next position
     command_history.current_index = (command_history.current_index + 1) % MAX_HISTORY_SIZE;
-    
+
     // Update history count
     if (command_history.history_count < MAX_HISTORY_SIZE) {
         command_history.history_count++;
     }
-    
+
     // Reset display index when new command is added
     command_history.display_index = -1;
 }
@@ -145,7 +145,7 @@ const char* command_history_get_previous(void) {
     if (command_history.history_count == 0) {
         return NULL;
     }
-    
+
     if (command_history.display_index == -1) {
         // First time navigating, start from the most recent command
         command_history.display_index = (command_history.current_index - 1 + MAX_HISTORY_SIZE) % MAX_HISTORY_SIZE;
@@ -153,7 +153,7 @@ const char* command_history_get_previous(void) {
         // Move to previous command
         command_history.display_index = (command_history.display_index - 1 + MAX_HISTORY_SIZE) % MAX_HISTORY_SIZE;
     }
-    
+
     // Additional safety check to ensure we have a valid command
     if (command_history.display_index >= 0 && command_history.display_index < MAX_HISTORY_SIZE) {
         const char* cmd = command_history.commands[command_history.display_index];
@@ -161,7 +161,7 @@ const char* command_history_get_previous(void) {
             return cmd;
         }
     }
-    
+
     return NULL;
 }
 
@@ -169,20 +169,20 @@ const char* command_history_get_next(void) {
     if (command_history.history_count == 0) {
         return NULL;
     }
-    
+
     if (command_history.display_index == -1) {
         return NULL; // No navigation started yet
     }
-    
+
     // Move to next command
     command_history.display_index = (command_history.display_index + 1) % MAX_HISTORY_SIZE;
-    
+
     // If we've reached the current position, we're at the end
     if (command_history.display_index == command_history.current_index) {
         command_history.display_index = -1;
         return NULL;
     }
-    
+
     // Additional safety check to ensure we have a valid command
     if (command_history.display_index >= 0 && command_history.display_index < MAX_HISTORY_SIZE) {
         const char* cmd = command_history.commands[command_history.display_index];
@@ -190,7 +190,7 @@ const char* command_history_get_next(void) {
             return cmd;
         }
     }
-    
+
     return NULL;
 }
 
@@ -203,13 +203,13 @@ static void move_cursor_to_position(int new_pos) {
     // Ensure cursor position is within bounds
     if (new_pos < 0) new_pos = 0;
     if (new_pos > strlen(serial_buffer)) new_pos = strlen(serial_buffer);
-    
+
     int current_pos = cursor_position;
     cursor_position = new_pos;
-    
+
     // Calculate how many characters to move
     int move_count = new_pos - current_pos;
-    
+
     if (move_count > 0) {
         // Move right - send right arrow sequences
         for (int i = 0; i < move_count; i++) {
@@ -234,22 +234,22 @@ static void move_cursor_to_position(int new_pos) {
 static void insert_character_at_cursor(char c) {
     int len = strlen(serial_buffer);
     if (len >= SERIAL_BUFFER_SIZE - 1) return; // Buffer full
-    
+
     // Shift characters to the right
     for (int i = len; i > cursor_position; i--) {
         serial_buffer[i] = serial_buffer[i - 1];
     }
-    
+
     // Insert character at cursor position
     serial_buffer[cursor_position] = c;
     serial_buffer[len + 1] = '\0';
-    
+
     // Display the character and move cursor right
     uart_write_bytes(UART_NUM, &c, 1);
 #if JTAG_SUPPORTED
     usb_serial_jtag_write_bytes((const uint8_t*)&c, 1, 0);
 #endif
-    
+
     // Display remaining characters
     for (int i = cursor_position + 1; i <= len; i++) {
         uart_write_bytes(UART_NUM, &serial_buffer[i], 1);
@@ -257,7 +257,7 @@ static void insert_character_at_cursor(char c) {
         usb_serial_jtag_write_bytes((const uint8_t*)&serial_buffer[i], 1, 0);
 #endif
     }
-    
+
     // Move cursor back to correct position
     for (int i = len; i > cursor_position; i--) {
         const char left_arrow[] = "\033[D";
@@ -266,14 +266,14 @@ static void insert_character_at_cursor(char c) {
         usb_serial_jtag_write_bytes((const uint8_t*)left_arrow, 3, 0);
 #endif
     }
-    
+
     cursor_position++;
 }
 
 static void delete_character_at_cursor(void) {
     int len = strlen(serial_buffer);
     if (cursor_position >= len) return; // Nothing to delete
-    
+
     // Shift characters to the left
     for (int i = cursor_position; i < len; i++) {
         serial_buffer[i] = serial_buffer[i + 1];
@@ -289,14 +289,14 @@ static void delete_character_at_cursor(void) {
         usb_serial_jtag_write_bytes((const uint8_t*)&serial_buffer[i], 1, 0);
 #endif
     }
-    
+
     // Clear the last character
     const char space[] = " ";
     uart_write_bytes(UART_NUM, space, 1);
 #if JTAG_SUPPORTED
     usb_serial_jtag_write_bytes((const uint8_t*)space, 1, 0);
 #endif
-    
+
     // Move cursor back to correct position
     for (int i = len - cursor_position; i > 0; i--) {
         const char left_arrow[] = "\033[D";
@@ -310,14 +310,14 @@ static void delete_character_at_cursor(void) {
 static void backspace_at_cursor(void) {
     int len = strlen(serial_buffer);
     if (cursor_position <= 0) return; // Nothing to delete
-    
+
     // Move cursor left first
     const char left_arrow[] = "\033[D";
     uart_write_bytes(UART_NUM, left_arrow, 3);
 #if JTAG_SUPPORTED
     usb_serial_jtag_write_bytes((const uint8_t*)left_arrow, 3, 0);
 #endif
-    
+
     // Shift characters to the left (delete character at cursor_position - 1)
     for (int i = cursor_position - 1; i < len; i++) {
         serial_buffer[i] = serial_buffer[i + 1];
@@ -333,14 +333,14 @@ static void backspace_at_cursor(void) {
         usb_serial_jtag_write_bytes((const uint8_t*)&serial_buffer[i], 1, 0);
 #endif
     }
-    
+
     // Clear the last character
     const char space[] = " ";
     uart_write_bytes(UART_NUM, space, 1);
 #if JTAG_SUPPORTED
     usb_serial_jtag_write_bytes((const uint8_t*)space, 1, 0);
 #endif
-    
+
     // Move cursor back to correct position
     for (int i = len - cursor_position + 1; i > 0; i--) {
         uart_write_bytes(UART_NUM, left_arrow, 3);
@@ -348,7 +348,7 @@ static void backspace_at_cursor(void) {
         usb_serial_jtag_write_bytes((const uint8_t*)left_arrow, 3, 0);
 #endif
     }
-    
+
     cursor_position--;
 }
 
@@ -453,7 +453,7 @@ static void process_html_line(const char* line) {
         glog("HTML capture started\n");
         return;
     }
-    
+
     if (strstr(line, "[HTML/CLOSE]") != NULL) {
         if (html_capture_state == HTML_STATE_CAPTURING) {
             html_capture_state = HTML_STATE_COMPLETE;
@@ -462,7 +462,7 @@ static void process_html_line(const char* line) {
         }
         return;
     }
-    
+
     if (html_capture_state == HTML_STATE_CAPTURING) {
         size_t line_len = strlen(line);
         if (html_capture_pos + line_len + 1 < sizeof(html_capture_buffer)) {
@@ -472,7 +472,7 @@ static void process_html_line(const char* line) {
         }
         return;
     }
-    
+
     handle_serial_command(line);
 }
 
@@ -524,14 +524,14 @@ void serial_task(void *pvParameter) {
         if (incoming_char == '\b' || (unsigned char)incoming_char == 0x7F) {
           // Reset arrow key state when backspace is pressed
           arrow_state = ARROW_STATE_NONE;
-          
+
           // Enable output deferral when user is editing
           if (!output_deferred) {
             glog_set_defer(1);
             output_deferred = true;
           }
           last_typing_activity_tick = xTaskGetTickCount();
-          
+
           if (cursor_position > 0) {
             // Delete character to the left of cursor
             backspace_at_cursor();
@@ -560,7 +560,7 @@ void serial_task(void *pvParameter) {
                 output_deferred = true;
               }
               last_typing_activity_tick = xTaskGetTickCount();
-              
+
               // Clear entire line to remove any existing text
               clear_entire_line();
               // Display prompt
@@ -580,14 +580,14 @@ void serial_task(void *pvParameter) {
             }
           } else if (incoming_char == 'B') { // Down arrow
             const char* history_cmd = command_history_get_next();
-            
+
             // Enable output deferral when navigating history
             if (!output_deferred) {
               glog_set_defer(1);
               output_deferred = true;
             }
             last_typing_activity_tick = xTaskGetTickCount();
-            
+
             // Clear entire line to remove any existing text
             clear_entire_line();
             // Display prompt
@@ -618,7 +618,7 @@ void serial_task(void *pvParameter) {
               output_deferred = true;
             }
             last_typing_activity_tick = xTaskGetTickCount();
-            
+
             if (cursor_position < strlen(serial_buffer)) {
               move_cursor_to_position(cursor_position + 1);
             }
@@ -629,7 +629,7 @@ void serial_task(void *pvParameter) {
               output_deferred = true;
             }
             last_typing_activity_tick = xTaskGetTickCount();
-            
+
             if (cursor_position > 0) {
               move_cursor_to_position(cursor_position - 1);
             }
@@ -651,7 +651,7 @@ void serial_task(void *pvParameter) {
             glog_flush_deferred();
             output_deferred = false;
           }
-          
+
           // Echo newline directly to UART
           const char newline[] = "\n";
           if (!s_uart_disabled) uart_write_bytes(UART_NUM, newline, 1);
@@ -686,14 +686,14 @@ void serial_task(void *pvParameter) {
           if (!prompt_displayed) {
             display_prompt();
           }
-          
+
           // Enable output deferral when user starts typing
           if (!output_deferred) {
             glog_set_defer(1);
             output_deferred = true;
           }
           last_typing_activity_tick = xTaskGetTickCount();
-          
+
           if (strlen(serial_buffer) < SERIAL_BUFFER_SIZE - 1) {
             // Insert character at cursor position
             insert_character_at_cursor(incoming_char);
@@ -743,7 +743,7 @@ void serial_task(void *pvParameter) {
 void serial_manager_init() {
   // UART configuration for main UART
   const uart_config_t uart_config = {
-      .baud_rate = CONFIG_CONSOLE_UART_BAUDRATE,
+      .baud_rate = 115200,
       .data_bits = UART_DATA_8_BITS,
       .parity = UART_PARITY_DISABLE,
       .stop_bits = UART_STOP_BITS_1,
@@ -814,7 +814,7 @@ int handle_serial_command(const char *input) {
     esp_comm_manager_set_remote_command_flag(false);
     return result;
   }
-  
+
   char input_copy[SERIAL_BUFFER_SIZE];
   size_t input_len = strlen(input);
   if (input_len >= sizeof(input_copy)) {

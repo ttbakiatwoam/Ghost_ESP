@@ -8,66 +8,66 @@ menu "Ghost ESP Options"
         help
             Specify GESP build config template that was used at build time.
     endmenu
-    
+
     menu "LED Options"
-    
+
     config USE_NEOPIXEL
         bool "Use Neopixel RGB LEDs"
         default n
         help
             Enable Neopixel RGB LED support. When enabled, a single data pin will be used for RGB control.
-    
+
     config LED_DATA_PIN
         int "LED Data Pin"
         default 0
         depends on USE_NEOPIXEL
         help
             Set the data pin for Neopixel LEDs.
-    
+
     config NUM_LEDS
         int "Number of LEDs"
         default 0
         help
             Set the number of LEDs connected.
-    
+
     config RED_RGB_PIN
         int "Red RGB Pin"
         default 0
         depends on !USE_NEOPIXEL
         help
             Define the pin for the red color of RGB LED when not using Neopixel.
-    
+
     config GREEN_RGB_PIN
         int "Green RGB Pin"
         default 0
         depends on !USE_NEOPIXEL
         help
             Define the pin for the green color of RGB LED when not using Neopixel.
-    
+
     config BLUE_RGB_PIN
         int "Blue RGB Pin"
         default 0
         depends on !USE_NEOPIXEL
         help
             Define the pin for the blue color of RGB LED when not using Neopixel.
-    
+
     endmenu
-    
+
     menu "Display Options"
-    
+
     config WITH_SCREEN
         bool "Enable Screen Support"
         default n
         help
             Enable or disable screen support.
-    
+
     config TFT_WIDTH
         int "TFT Width"
         default 240
         depends on WITH_SCREEN
         help
             Set the width of the TFT display.
-    
+
     config TFT_HEIGHT
         int "TFT Height"
         default 320
@@ -110,6 +110,13 @@ menu "Ghost ESP Options"
         default n
         help
             Enable support for JC3248W535EN LCD.
+
+    config USE_WAVESHARE_AMOLED
+        bool "Enable Waveshare ESP32-S3 1.8 inch AMOLED"
+        default n
+        help
+            Enable support for Waveshare ESP32-S3 1.8 inch AMOLED
+            with RM67162 QSPI display, CST816T touch, and QMI8658 IMU.
 
     config USE_ILI9341_2
         bool "Use ILI9341 2nd Display Driver"
@@ -185,35 +192,35 @@ menu "Ghost ESP Options"
             default n
             help
                 Enable joystick input.
-                
+
         config USE_IO_EXPANDER
             bool "Enable IO Expander (TCA9535)"
             default n
             depends on USE_JOYSTICK
             help
                 Enable TCA9535 IO expander for joystick input via I2C.
-                
+
         config IO_EXPANDER_SDA_PIN
             int "IO Expander SDA Pin"
             default 6
             depends on USE_IO_EXPANDER
             help
                 Set the SDA pin for the TCA9535 IO expander.
-                
+
         config IO_EXPANDER_SCL_PIN
             int "IO Expander SCL Pin"
             default 7
             depends on USE_IO_EXPANDER
             help
                 Set the SCL pin for the TCA9535 IO expander.
-                
+
         config IO_EXPANDER_I2C_ADDR
             hex "IO Expander I2C Address"
             default 0x74
             depends on USE_IO_EXPANDER
             help
                 Set the I2C address for the TCA9535 IO expander.
-                
+
         config L_BTN
             int "Left button data pin"
             default 0
@@ -244,13 +251,13 @@ menu "Ghost ESP Options"
             depends on USE_JOYSTICK
             help
                 Set the data pin for center button
-                
+
         config USE_TDECK
             bool "Enable TDECK-plus"
             default n
             help
                 Enable tdeck logics.
-    
+
         config USE_CARDPUTER
             bool "Enable Cardputer"
             default n
@@ -262,13 +269,13 @@ menu "Ghost ESP Options"
             default n
             help
                 Enable Cardputer ADV keyboard support using the TCA8418 keypad controller.
-        
+
         config USE_TDISPLAY_S3
             bool "Enable T-Display S3"
             default n
             help
                 Enable support for LilyGo T-Display S3 with ST7789 display and CST816 touch.
-        
+
         config USE_HW_KB
             bool "Enable Hardware Keyboard"
             default n
@@ -336,7 +343,7 @@ menu "Ghost ESP Options"
             default n
             help
                 Enable ADC battery readings
-                
+
         config ADC_BATTERY_PIN
             int "Pin for reading ADC measurements"
             default -1
@@ -412,7 +419,7 @@ menu "Ghost ESP Options"
             depends on USE_MAX17048_FUEL_GAUGE
             help
                 GPIO pin for MAX17048 I2C SCL line.
-    
+
         config HAS_RTC_CLOCK
             bool "Enable RTC Clock"
             default n
@@ -464,42 +471,42 @@ menu "Ghost ESP Options"
             default n
             help
                 Enable Ethernet Support.
-                
+
         config ETH_W5500_MOSI_PIN
             int "W5500 MOSI Pin"
             default 6
             depends on WITH_ETHERNET
             help
                 Set the GPIO pin for W5500 MOSI (Master Out Slave In).
-                
+
         config ETH_W5500_MISO_PIN
             int "W5500 MISO Pin"
             default 5
             depends on WITH_ETHERNET
             help
                 Set the GPIO pin for W5500 MISO (Master In Slave Out).
-                
+
         config ETH_W5500_SCK_PIN
             int "W5500 SCK Pin"
             default 4
             depends on WITH_ETHERNET
             help
                 Set the GPIO pin for W5500 SCK (Serial Clock).
-                
+
         config ETH_W5500_CS_PIN
             int "W5500 CS Pin"
             default 15
             depends on WITH_ETHERNET
             help
                 Set the GPIO pin for W5500 CS (Chip Select).
-                
+
         config ETH_W5500_INT_PIN
             int "W5500 INT Pin (optional, use -1 to disable)"
             default 7
             depends on WITH_ETHERNET
             help
                 Set the GPIO pin for W5500 INT (Interrupt). Use -1 if not connected.
-            
+
         config IS_GHOST_BOARD
             bool "Enable Ghost Board Configuration"
             default n
@@ -617,22 +624,22 @@ menu "Ghost ESP Options"
         endmenu
 
     endmenu
-    
+
     menu "GPS Configuration"
-    
+
     config HAS_GPS
         bool "Enable GPS"
         default n
         help
             Enable GPS support.
-    
+
     config GPS_UART_RX_PIN
         int "GPS UART RX Pin"
         default 16
         depends on HAS_GPS
         help
             Define the UART RX pin for GPS.
-    
+
     config GPS_UART_BAUD_RATE
         int "Set baud rate for gps serial"
         default 9600
@@ -730,9 +737,9 @@ menu "Ghost ESP Options"
                 - Magnetic variation;
 
     endmenu
-    
+
     endmenu
-    
+
     menu "Compass Configuration"
 
     config HAS_COMPASS

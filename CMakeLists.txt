@@ -9,7 +9,7 @@ endif()
 # Partition table settings
 add_link_options("-Wl,-z,muldefs")
 
-set(SDKCONFIG_DEFAULTS "sdkconfig.defaults")
+set(SDKCONFIG_DEFAULTS "configs/sdkconfig.WaveshareAMOLED")
 add_compile_definitions(HOLD_LIMIT=1000) # For joystick hold duration
 add_compile_definitions(LED_ORDER=0)     # 2 for RGB, 0 for GRB
 add_compile_definitions(DNS_SERVER_MAX_ITEMS=1)
@@ -33,7 +33,7 @@ if(GIT_FOUND)
     if(NOT GIT_COMMIT_HASH)
         set(GIT_COMMIT_HASH "unknown")
     endif()
-    
+
     execute_process(
         COMMAND ${GIT_EXECUTABLE} rev-parse --abbrev-ref HEAD
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}

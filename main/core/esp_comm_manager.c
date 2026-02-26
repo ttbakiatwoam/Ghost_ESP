@@ -54,6 +54,10 @@
 #if defined(CONFIG_IDF_TARGET_ESP32)
 #define DEFAULT_TX_PIN GPIO_NUM_17
 #define DEFAULT_RX_PIN GPIO_NUM_16
+#elif defined(CONFIG_USE_WAVESHARE_AMOLED)
+// Waveshare AMOLED uses GPIO 6/7 for QSPI D2/D3 — disable ESP comm UART
+#define DEFAULT_TX_PIN GPIO_NUM_NC
+#define DEFAULT_RX_PIN GPIO_NUM_NC
 #else
 #define DEFAULT_TX_PIN GPIO_NUM_6
 #define DEFAULT_RX_PIN GPIO_NUM_7
@@ -101,11 +105,11 @@ typedef struct {
     gpio_num_t tx_pin;
     gpio_num_t rx_pin;
     uint32_t baud_rate;
-    
+
     comm_state_t state;
     comm_role_t role;
     comm_peer_t peer;
-    
+
     QueueHandle_t rx_packet_queue;
     QueueHandle_t tx_queue;
     QueueHandle_t command_queue;
@@ -116,13 +120,13 @@ typedef struct {
     TimerHandle_t discovery_timer;
     TimerHandle_t handshake_timer;
     TimerHandle_t ping_timer;
-    
+
     comm_command_callback_t command_callback;
     void* callback_user_data;
-    
+
     char chip_name[32];
     uint8_t chip_id[6];
-    
+
     volatile bool initialized;
     bool is_executing_remote_cmd;
     bool uart_driver_installed;

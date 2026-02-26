@@ -3,10 +3,12 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_rom_sys.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "i2c_bus_lock.h"
+#include "core/glog.h"
 #include <stdio.h>
 
 static const char *TAG = "IO_MANAGER";
@@ -63,6 +65,60 @@ static esp_err_t tca9535_read_inputs(uint8_t *port0, uint8_t *port1);
 static esp_err_t tca9535_write_port(uint8_t reg, uint8_t data);
 static void io_manager_process_sample(uint8_t port0, uint8_t port1, btn_event_t *event_out);
 static void io_manager_task(void *arg);
+static bool i2c_bus_recover(int sda, int scl, int port);
+static esp_err_t i2c_write_reg8_direct(uint8_t addr, uint8_t reg, uint8_t val);
+static esp_err_t i2c_read_reg8_direct(uint8_t addr, uint8_t reg, uint8_t *val);
+static void io_manager_pulse_p13_low_direct(void);
+
+static bool i2c_bus_recover(int sda, int scl, int port)
+{
+    const int RECOVERY_US = 6;
+
+    bool have_lock = i2c_bus_lock(port, 100);
+
+    gpio_set_direction(sda, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+    gpio_set_direction(scl, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+    esp_rom_delay_us(RECOVERY_US);
+
+    if (gpio_get_level(scl) == 0) {
+        vTaskDelay(pdMS_TO_TICKS(2));
+        if (gpio_get_level(scl) == 0) {
+            ESP_LOGW(TAG, "I2C bus recovery: SCL stuck low");
+            if (have_lock) i2c_bus_unlock(port);
+            return false;
+        }
+    }
+
+    if (gpio_get_level(sda) == 0) {
+        for (int i = 0; i < 9; i++) {
+            gpio_set_direction(scl, GPIO_MODE_OUTPUT);
+            gpio_set_level(scl, 0);
+            esp_rom_delay_us(RECOVERY_US);
+            gpio_set_direction(scl, GPIO_MODE_INPUT);
+            gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+            esp_rom_delay_us(RECOVERY_US);
+            if (gpio_get_level(sda) == 1) break;
+        }
+    }
+
+    gpio_set_direction(scl, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(scl, GPIO_PULLUP_ONLY);
+    esp_rom_delay_us(RECOVERY_US);
+    gpio_set_direction(sda, GPIO_MODE_OUTPUT);
+    gpio_set_level(sda, 0);
+    esp_rom_delay_us(RECOVERY_US);
+    gpio_set_direction(sda, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(sda, GPIO_PULLUP_ONLY);
+    esp_rom_delay_us(RECOVERY_US);
+
+    bool ok = (gpio_get_level(scl) == 1) && (gpio_get_level(sda) == 1);
+    ESP_LOGI(TAG, "I2C bus recovery: %s", ok ? "OK" : "FAILED");
+    
+    if (have_lock) i2c_bus_unlock(port);
+    return ok;
+}
 
 esp_err_t io_manager_init(const io_manager_config_t *config)
 {
@@ -78,6 +134,9 @@ esp_err_t io_manager_init(const io_manager_config_t *config)
 
     // Copy configuration
     g_config = *config;
+
+    i2c_bus_recover(g_config.sda_pin, g_config.scl_pin, g_config.i2c_port);
+    vTaskDelay(pdMS_TO_TICKS(2));
 
     // create mutex for i2c bus access
     if (!g_i2c_mutex) {
@@ -95,28 +154,28 @@ esp_err_t io_manager_init(const io_manager_config_t *config)
         .scl_io_num = g_config.scl_pin,
         .sda_pullup_en = GPIO_PULLUP_ENABLE,
         .scl_pullup_en = GPIO_PULLUP_ENABLE,
-        // Keep shared port at 100 kHz so PN532 modules can coexist with the expander/status display.
-        .master.clk_speed = 100000,
+        .master.clk_speed = 400000,
     };
 
-    // Try to install the driver first; if it's already installed, skip param_config
-    esp_err_t ret = i2c_driver_install(g_config.i2c_port, I2C_MODE_MASTER, 0, 0, 0);
-    if (ret == ESP_OK) {
-        g_i2c_driver_installed = true;
-        // We own the driver: safe to configure pins/clock
-        ret = i2c_param_config(g_config.i2c_port, &i2c_conf);
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "Failed to configure I2C parameters: %s", esp_err_to_name(ret));
-            return ret;
-        }
-    } else if (ret == ESP_ERR_INVALID_STATE || ret == ESP_FAIL) {
-        // Driver already installed elsewhere; share without reconfiguring
-        ESP_LOGW(TAG, "I2C driver already installed on port %d; sharing", g_config.i2c_port);
-        g_i2c_driver_installed = false;
-    } else {
+    // Clean reinit like Arduino Wire.end() + Wire.begin()
+    (void)i2c_driver_delete(g_config.i2c_port);  // ignore error if not installed
+    vTaskDelay(pdMS_TO_TICKS(2));
+
+    // Configure pins first (like Wire.begin does)
+    esp_err_t ret = i2c_param_config(g_config.i2c_port, &i2c_conf);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure I2C parameters: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    ret = i2c_driver_install(g_config.i2c_port, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGE(TAG, "Failed to install I2C driver: %s", esp_err_to_name(ret));
         return ret;
     }
+    g_i2c_driver_installed = (ret == ESP_OK);
+
+    io_manager_pulse_p13_low_direct();
 
     // Configure TCA9535 ports as inputs with pull-ups enabled
     // Note: TCA9535 inputs are high-impedance. If using PCF8575 or similar, writing 1 to output enables weak pull-up.
@@ -362,7 +421,8 @@ static esp_err_t tca9535_read_port(uint8_t reg, uint8_t *data)
         if (attempt > 0) {
             vTaskDelay(pdMS_TO_TICKS(2));
         }
-        bool global_locked = i2c_bus_lock(g_config.i2c_port, 60);
+        // Increased timeout to 200ms to avoid false timeouts during heavy init
+        bool global_locked = i2c_bus_lock(g_config.i2c_port, 200);
         if (!global_locked) {
             ret = ESP_ERR_TIMEOUT;
             continue;
@@ -544,7 +604,8 @@ static esp_err_t tca9535_write_port(uint8_t reg, uint8_t data)
         if (attempt > 0) {
             vTaskDelay(pdMS_TO_TICKS(2));
         }
-        bool global_locked = i2c_bus_lock(g_config.i2c_port, 60);
+        // Increased timeout to 200ms to avoid false timeouts during heavy init
+        bool global_locked = i2c_bus_lock(g_config.i2c_port, 200);
         if (!global_locked) {
             ret = ESP_ERR_TIMEOUT;
             continue;
@@ -578,16 +639,10 @@ static esp_err_t tca9535_write_port(uint8_t reg, uint8_t data)
     return ret;
 }
 
-esp_err_t i2c_write_reg8_direct(uint8_t addr, uint8_t reg, uint8_t val)
+static esp_err_t i2c_write_reg8_direct(uint8_t addr, uint8_t reg, uint8_t val)
 {
-    bool locked = i2c_bus_lock(g_config.i2c_port, 50);
-    if (!locked) return ESP_ERR_TIMEOUT;
-
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (!cmd) {
-        i2c_bus_unlock(g_config.i2c_port);
-        return ESP_ERR_NO_MEM;
-    }
+    if (!cmd) return ESP_ERR_NO_MEM;
     
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
@@ -597,20 +652,13 @@ esp_err_t i2c_write_reg8_direct(uint8_t addr, uint8_t reg, uint8_t val)
     
     esp_err_t ret = i2c_master_cmd_begin(g_config.i2c_port, cmd, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(cmd);
-    i2c_bus_unlock(g_config.i2c_port);
     return ret;
 }
 
-esp_err_t i2c_read_reg8_direct(uint8_t addr, uint8_t reg, uint8_t *val)
+static esp_err_t i2c_read_reg8_direct(uint8_t addr, uint8_t reg, uint8_t *val)
 {
-    bool locked = i2c_bus_lock(g_config.i2c_port, 50);
-    if (!locked) return ESP_ERR_TIMEOUT;
-
     i2c_cmd_handle_t cmd = i2c_cmd_link_create();
-    if (!cmd) {
-        i2c_bus_unlock(g_config.i2c_port);
-        return ESP_ERR_NO_MEM;
-    }
+    if (!cmd) return ESP_ERR_NO_MEM;
     
     i2c_master_start(cmd);
     i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
@@ -622,9 +670,152 @@ esp_err_t i2c_read_reg8_direct(uint8_t addr, uint8_t reg, uint8_t *val)
     
     esp_err_t ret = i2c_master_cmd_begin(g_config.i2c_port, cmd, pdMS_TO_TICKS(50));
     i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static void io_manager_pulse_p13_low_direct(void)
+{
+    const uint8_t P13_BIT = 3;
+    const uint8_t P13_MASK = (1 << P13_BIT);
+    const uint8_t REG_OUT1 = 0x03;
+    const uint8_t REG_CFG1 = 0x07;
+
+    ESP_LOGI(TAG, "pulsing P13 LOW for 50ms @0x%02X...", g_config.i2c_addr);
+
+    if (!i2c_bus_lock(g_config.i2c_port, 500)) {
+        ESP_LOGW(TAG, "P13 pulse: failed to lock I2C bus");
+        return;
+    }
+
+    uint8_t cfg1 = 0xFF;
+    esp_err_t ret = i2c_read_reg8_direct(g_config.i2c_addr, REG_CFG1, &cfg1);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "read CFG1 failed: %s", esp_err_to_name(ret));
+        i2c_bus_unlock(g_config.i2c_port);
+        return;
+    }
+
+    uint8_t cfg1_new = cfg1 & ~P13_MASK;
+    if (cfg1_new != cfg1) {
+        ret = i2c_write_reg8_direct(g_config.i2c_addr, REG_CFG1, cfg1_new);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "write CFG1 failed: %s", esp_err_to_name(ret));
+            i2c_bus_unlock(g_config.i2c_port);
+            return;
+        }
+    }
+
+    uint8_t out1 = 0xFF;
+    ret = i2c_read_reg8_direct(g_config.i2c_addr, REG_OUT1, &out1);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "read OUT1 failed: %s", esp_err_to_name(ret));
+        i2c_bus_unlock(g_config.i2c_port);
+        return;
+    }
+
+    uint8_t out1_low = out1 & ~P13_MASK;
+    ret = i2c_write_reg8_direct(g_config.i2c_addr, REG_OUT1, out1_low);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "write OUT1 (LOW) failed: %s", esp_err_to_name(ret));
+        i2c_bus_unlock(g_config.i2c_port);
+        return;
+    }
+
+    i2c_bus_unlock(g_config.i2c_port);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    
+    if (!i2c_bus_lock(g_config.i2c_port, 500)) {
+        ESP_LOGW(TAG, "P13 pulse: failed to relock I2C bus for HIGH");
+        return;
+    }
+
+    uint8_t out1_high = out1_low | P13_MASK;
+    ret = i2c_write_reg8_direct(g_config.i2c_addr, REG_OUT1, out1_high);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "write OUT1 (HIGH) failed: %s", esp_err_to_name(ret));
+    }
+
+    i2c_bus_unlock(g_config.i2c_port);
+    ESP_LOGI(TAG, "P13 pulse done");
+}
+
+esp_err_t io_manager_pulse_p13_low(void)
+{
+    const uint8_t P13_BIT = 3;
+    const uint8_t P13_MASK = (1 << P13_BIT);
+    const uint8_t REG_OUT1 = 0x03;
+    const uint8_t REG_CFG1 = 0x07;
+
+    glog("[TCA9539] @0x%02X: pulsing P13 LOW for 50ms...\n", g_config.i2c_addr);
+
+    bool locked = i2c_bus_lock(g_config.i2c_port, 500);
+    if (!locked) {
+        glog("[TCA9539] failed to lock i2c bus\n");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    esp_err_t ret;
+    uint8_t cfg1 = 0xFF;
+    ret = i2c_read_reg8_direct(g_config.i2c_addr, REG_CFG1, &cfg1);
+    if (ret != ESP_OK) {
+        glog("[TCA9539] read CFG1 failed\n");
+        goto out;
+    }
+
+    uint8_t cfg1_new = cfg1 & ~P13_MASK;
+    if (cfg1_new != cfg1) {
+        ret = i2c_write_reg8_direct(g_config.i2c_addr, REG_CFG1, cfg1_new);
+        if (ret != ESP_OK) {
+            glog("[TCA9539] write CFG1 failed\n");
+            goto out;
+        }
+    }
+
+    uint8_t out1 = 0xFF;
+    ret = i2c_read_reg8_direct(g_config.i2c_addr, REG_OUT1, &out1);
+    if (ret != ESP_OK) {
+        glog("[TCA9539] read OUT1 failed\n");
+        goto out;
+    }
+
+    uint8_t out1_low = out1 & ~P13_MASK;
+    ret = i2c_write_reg8_direct(g_config.i2c_addr, REG_OUT1, out1_low);
+    if (ret != ESP_OK) {
+        glog("[TCA9539] write OUT1 (LOW) failed\n");
+        goto out;
+    }
+
+    i2c_bus_unlock(g_config.i2c_port);
+    vTaskDelay(pdMS_TO_TICKS(50));
+    locked = i2c_bus_lock(g_config.i2c_port, 500);
+    if (!locked) {
+        glog("[TCA9539] failed to relock i2c bus for HIGH\n");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    uint8_t out1_high = out1_low | P13_MASK;
+    ret = i2c_write_reg8_direct(g_config.i2c_addr, REG_OUT1, out1_high);
+    if (ret != ESP_OK) {
+        glog("[TCA9539] write OUT1 (HIGH) failed\n");
+    }
+
+    glog("[TCA9539] P13 pulse done.\n");
+
+out:
     i2c_bus_unlock(g_config.i2c_port);
     return ret;
 }
+
+static int read_sda_pin(void)
+{
+    return gpio_get_level(g_config.sda_pin);
+}
+
+static int read_scl_pin(void)
+{
+    return gpio_get_level(g_config.scl_pin);
+}
+
 
 static void scan_single_i2c_port(i2c_port_t port, int *device_count, uint8_t *found_addresses, int max_devices)
 {
@@ -645,7 +836,7 @@ static void scan_single_i2c_port(i2c_port_t port, int *device_count, uint8_t *fo
                 continue;
             }
 
-            bool global_locked = i2c_bus_lock(port, 60);
+            bool global_locked = i2c_bus_lock(port, 200);
             if (!global_locked) {
                 if (pos < (int)sizeof(row_buf) - 2) {
                     row_buf[pos++] = '?';
@@ -691,7 +882,7 @@ static void scan_single_i2c_port(i2c_port_t port, int *device_count, uint8_t *fo
             vTaskDelay(1);
         }
         row_buf[pos] = '\0';
-        printf("%s\n", row_buf);
+        glog("%s\n", row_buf);
         vTaskDelay(1);
     }
 }
@@ -700,18 +891,18 @@ void io_manager_scan_i2c(void)
 {
     if (!g_i2c_mutex) {
         ESP_LOGE(TAG, "i2c not initialized");
-        printf("i2c not initialized\n");
+        glog("i2c not initialized\n");
         return;
     }
 
     if (xSemaphoreTake(g_i2c_mutex, pdMS_TO_TICKS(100)) != pdTRUE) {
         ESP_LOGE(TAG, "failed to acquire i2c mutex for scan");
-        printf("failed to acquire i2c mutex\n");
+        glog("failed to acquire i2c mutex\n");
         return;
     }
 
-    printf("\n=== i2c bus scan ===\n");
-    printf("SDA=%d SCL=%d | 100kHz | timeout=50ms\n", g_config.sda_pin, g_config.scl_pin);
+    glog("\n=== i2c bus scan ===\n");
+    glog("SDA=%d SCL=%d | 100kHz | timeout=50ms\n", g_config.sda_pin, g_config.scl_pin);
 
     int device_count = 0;
     uint8_t found_addresses[120];
@@ -728,25 +919,25 @@ void io_manager_scan_i2c(void)
     for (int i = 0; i < num_ports && device_count < max_devices; i++) {
         i2c_port_t port = ports_to_scan[i];
         
-        printf("\nscanning i2c port %d...\n", (int)port);
-        printf("  | 0 1 2 3 4 5 6 7 8 9 a b c d e f\n");
-        printf("--+--------------------------------\n");
+        glog("\nscanning i2c port %d...\n", (int)port);
+        glog("  | 0 1 2 3 4 5 6 7 8 9 a b c d e f\n");
+        glog("--+--------------------------------\n");
         
         scan_single_i2c_port(port, &device_count, found_addresses, max_devices);
         
-        printf("\n");
+        glog("\n");
     }
 
-    printf("found %d device(s) total\n", device_count);
+    glog("found %d device(s) total\n", device_count);
     
     if (device_count > 0) {
-        printf("\ndetected devices:\n");
+        glog("\ndetected devices:\n");
         for (int i = 0; i < device_count; i++) {
-            printf("  - device at address 0x%02x\n", found_addresses[i]);
+            glog("  - device at address 0x%02x\n", found_addresses[i]);
             ESP_LOGI(TAG, "found i2c device at address 0x%02x", found_addresses[i]);
         }
     } else {
-        printf("no devices found\n");
+        glog("no devices found\n");
     }
     
     ESP_LOGI(TAG, "i2c scan complete, found %d devices", device_count);

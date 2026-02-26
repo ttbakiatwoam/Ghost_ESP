@@ -86,6 +86,268 @@ static volatile bool g_cached_batt_valid = false;
 #include "vendor/drivers/axs15231b.h"
 #endif
 
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+#include "rm67162_qspi.h"
+#include "esp_lcd_rm67162.h"
+#include "cst816t.h"
+#include "vendor/drivers/qmi8658.h"
+#include <math.h>
+
+// Waveshare 1.8" AMOLED pin definitions
+#define WS_AMOLED_LCD_CS    12
+#define WS_AMOLED_LCD_SCK   11
+#define WS_AMOLED_LCD_D0    4
+#define WS_AMOLED_LCD_D1    5
+#define WS_AMOLED_LCD_D2    6
+#define WS_AMOLED_LCD_D3    7
+#define WS_AMOLED_LCD_RST   13
+#define WS_AMOLED_I2C_SDA   15
+#define WS_AMOLED_I2C_SCL   14
+#define WS_AMOLED_TOUCH_INT 21
+#define WS_AMOLED_TOUCH_ADDR 0x38
+
+// TCA9554 IO expander (controls display/touch power/reset)
+#define WS_TCA9554_ADDR     0x20
+#define TCA9554_REG_OUTPUT  0x01
+#define TCA9554_REG_CONFIG  0x03
+
+static esp_err_t tca9554_write_reg(uint8_t reg, uint8_t value) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (WS_TCA9554_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_write_byte(cmd, value, true);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t tca9554_read_reg(uint8_t reg, uint8_t *value) {
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (WS_TCA9554_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_write_byte(cmd, reg, true);
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (WS_TCA9554_ADDR << 1) | I2C_MASTER_READ, true);
+    i2c_master_read_byte(cmd, value, I2C_MASTER_NACK);
+    i2c_master_stop(cmd);
+    esp_err_t ret = i2c_master_cmd_begin(I2C_NUM_0, cmd, pdMS_TO_TICKS(1000));
+    i2c_cmd_link_delete(cmd);
+    return ret;
+}
+
+static esp_err_t tca9554_set_pin_direction(uint8_t pin_mask, bool output) {
+    uint8_t config;
+    esp_err_t ret = tca9554_read_reg(TCA9554_REG_CONFIG, &config);
+    if (ret != ESP_OK) return ret;
+    if (output) config &= ~pin_mask;
+    else        config |= pin_mask;
+    return tca9554_write_reg(TCA9554_REG_CONFIG, config);
+}
+
+static esp_err_t tca9554_set_pin_level(uint8_t pin_mask, bool high) {
+    uint8_t output;
+    esp_err_t ret = tca9554_read_reg(TCA9554_REG_OUTPUT, &output);
+    if (ret != ESP_OK) return ret;
+    if (high) output |= pin_mask;
+    else      output &= ~pin_mask;
+    return tca9554_write_reg(TCA9554_REG_OUTPUT, output);
+}
+
+static esp_lcd_panel_handle_t s_amoled_panel = NULL;
+static void *s_amoled_qspi_ctx = NULL;
+static cst816t_handle_t s_amoled_touch = NULL;
+
+// QMI8658 IMU auto-rotation state
+static TaskHandle_t s_imu_task_handle = NULL;
+static volatile int s_imu_orientation = 0; // 0=portrait, 1=land-R, 2=inverted, 3=land-L
+
+#define IMU_TAG "IMU_Orient"
+
+/**
+ * @brief IMU orientation polling task — reads accelerometer and applies
+ *        LVGL display rotation when the device is physically rotated.
+ *        Mirrors the debounce logic from the Waveshare display_test app.
+ */
+static void imu_orientation_task(void *pvParameters) {
+    const float THRESHOLD = 0.4f;
+    const int DEBOUNCE_REQUIRED = 3;
+    int pending_orientation = s_imu_orientation;
+    int debounce_count = 0;
+
+    while (1) {
+        float ax, ay, az;
+        if (qmi8658_get_accel(&ax, &ay, &az) != ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+            continue;
+        }
+
+        int orientation = s_imu_orientation; // default: keep current
+        float abs_x = fabsf(ax);
+        float abs_y = fabsf(ay);
+
+        if (abs_x > abs_y + THRESHOLD) {
+            orientation = (ax > 0) ? 1 : 3;
+        } else if (abs_y > abs_x + THRESHOLD) {
+            orientation = (ay > 0) ? 2 : 0;
+        }
+
+        if (orientation != s_imu_orientation) {
+            if (orientation == pending_orientation) {
+                debounce_count++;
+            } else {
+                pending_orientation = orientation;
+                debounce_count = 1;
+            }
+            if (debounce_count >= DEBOUNCE_REQUIRED) {
+                s_imu_orientation = orientation;
+                display_manager_set_rotation((uint8_t)orientation);
+                debounce_count = 0;
+                ESP_LOGI(IMU_TAG, "IMU auto-rotate: orientation=%d (%d°)",
+                         orientation, orientation * 90);
+            }
+        } else {
+            debounce_count = 0;
+            pending_orientation = s_imu_orientation;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(200));
+    }
+}
+
+/** Start IMU auto-rotation (called when setting = 4 "Auto"). */
+static void imu_auto_rotation_start(void) {
+    if (s_imu_task_handle != NULL) return; // already running
+    if (!qmi8658_is_ready()) {
+        ESP_LOGW(IMU_TAG, "QMI8658 not ready — cannot start auto-rotation");
+        return;
+    }
+    xTaskCreatePinnedToCore(imu_orientation_task, "imu_orient", 3072,
+                            NULL, 5, &s_imu_task_handle, 0);
+    ESP_LOGI(IMU_TAG, "IMU auto-rotation started");
+}
+
+/** Stop IMU auto-rotation (called when switching to a manual rotation). */
+static void imu_auto_rotation_stop(void) {
+    if (s_imu_task_handle == NULL) return;
+    vTaskDelete(s_imu_task_handle);
+    s_imu_task_handle = NULL;
+    ESP_LOGI(IMU_TAG, "IMU auto-rotation stopped");
+}
+
+static void waveshare_amoled_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
+                                      lv_color_t *color_p) {
+    esp_lcd_panel_draw_bitmap(s_amoled_panel,
+        area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+    lv_disp_flush_ready(drv);
+}
+
+static int16_t s_touch_last_x = 0;
+static int16_t s_touch_last_y = 0;
+
+/*
+ * Touch debouncing for CST816T.
+ *
+ * Two problems are addressed:
+ *
+ * 1. Mid-touch glitches: The CST816T occasionally reports points==0 for
+ *    one or two reads during a sustained touch (chip sleep/wake, I2C
+ *    timing).  We require TOUCH_RELEASE_FRAMES consecutive no-touch
+ *    reads before reporting REL.
+ *
+ * 2. Post-release echo: After a physical tap the CST816T often re-reports
+ *    touch data 1-3 more times (internal gesture engine echoing), which
+ *    produces multiple tap events from a single physical tap.  After a
+ *    confirmed release we ignore new presses for TOUCH_COOLDOWN_MS.
+ */
+#define TOUCH_RELEASE_FRAMES  3
+#define TOUCH_COOLDOWN_MS   300
+
+static int      s_touch_rel_count  = 0;
+static bool     s_touch_pressed    = false;
+static uint32_t s_touch_release_ms = 0;   /* timestamp of last confirmed release */
+
+static inline uint32_t touch_now_ms(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000);
+}
+
+/**
+ * @brief Transform raw touch coordinates from native panel space into the
+ *        current LVGL rotated coordinate space.  Mirrors the logic in
+ *        components/lvgl/src/core/lv_indev.c  indev_pointer_proc().
+ */
+static void ws_touch_rotate(lv_coord_t *x, lv_coord_t *y) {
+    lv_disp_t *disp = lv_disp_get_default();
+    if (!disp) return;
+    lv_disp_rot_t rot = disp->driver->rotated;
+    lv_coord_t w = disp->driver->hor_res;  /* native width  = 368 */
+    lv_coord_t h = disp->driver->ver_res;  /* native height = 448 */
+    if (rot == LV_DISP_ROT_180 || rot == LV_DISP_ROT_270) {
+        *x = w - *x - 1;
+        *y = h - *y - 1;
+    }
+    if (rot == LV_DISP_ROT_90 || rot == LV_DISP_ROT_270) {
+        lv_coord_t tmp = *y;
+        *y = *x;
+        *x = h - tmp - 1;
+    }
+}
+
+static void waveshare_amoled_touch_read(lv_indev_drv_t *drv, lv_indev_data_t *data) {
+    if (!s_amoled_touch) {
+        data->state = LV_INDEV_STATE_REL;
+        return;
+    }
+
+    cst816t_touch_data_t td;
+    bool hw_pressed = (cst816t_read_touch(s_amoled_touch, &td) == ESP_OK && td.points > 0);
+
+    /* ---- Post-release cooldown: suppress echoed presses ---- */
+    if (hw_pressed && !s_touch_pressed) {
+        uint32_t elapsed = touch_now_ms() - s_touch_release_ms;
+        if (elapsed < TOUCH_COOLDOWN_MS) {
+            hw_pressed = false;   /* treat as no-touch */
+        }
+    }
+
+    if (hw_pressed) {
+        /* Transform raw panel coords to rotated LVGL coords */
+        lv_coord_t rx = (lv_coord_t)td.x;
+        lv_coord_t ry = (lv_coord_t)td.y;
+        ws_touch_rotate(&rx, &ry);
+
+        /* Real touch detected — update coordinates and reset debounce */
+        s_touch_rel_count = 0;
+        s_touch_pressed   = true;
+        s_touch_last_x    = rx;
+        s_touch_last_y    = ry;
+        data->state   = LV_INDEV_STATE_PR;
+        data->point.x = rx;
+        data->point.y = ry;
+    } else if (s_touch_pressed) {
+        /* No hardware touch but we were pressed — debounce before releasing */
+        s_touch_rel_count++;
+        if (s_touch_rel_count >= TOUCH_RELEASE_FRAMES) {
+            /* Enough consecutive no-touch reads — real release */
+            s_touch_pressed    = false;
+            s_touch_release_ms = touch_now_ms();
+            data->state = LV_INDEV_STATE_REL;
+        } else {
+            /* Still within debounce window — keep reporting pressed */
+            data->state = LV_INDEV_STATE_PR;
+        }
+        data->point.x = s_touch_last_x;
+        data->point.y = s_touch_last_y;
+    } else {
+        /* Not pressed and not debouncing — idle */
+        data->state   = LV_INDEV_STATE_REL;
+        data->point.x = s_touch_last_x;
+        data->point.y = s_touch_last_y;
+    }
+}
+#endif
+
 #ifdef CONFIG_USE_TDECK
 #include "lvgl_i2c/i2c_manager.h"
 
@@ -252,6 +514,8 @@ static void invert_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
     m5stack_lvgl_render_callback(drv, area, color_p);
 #elif defined(CONFIG_USE_TDISPLAY_S3)
     i80_display_flush_cb(drv, area, color_p);
+#elif defined(CONFIG_USE_WAVESHARE_AMOLED)
+    waveshare_amoled_flush_cb(drv, area, color_p);
 #else
     disp_driver_flush(drv, area, color_p);
 #endif
@@ -725,6 +989,76 @@ void display_manager_set_rainbow_mode(bool enable) {
       display_manager_update_status_bar_color();
     }
   }
+}
+
+/**
+ * Internal callback executed on the LVGL task context.
+ * Applies the rotation, resizes the status bar, and rebuilds the current
+ * view when the aspect ratio changes (portrait ↔ landscape) so that every
+ * container, list item and button picks up the new LV_HOR_RES / LV_VER_RES.
+ */
+static void set_rotation_on_lvgl(void *param) {
+  uint8_t rotation = (uint8_t)(uintptr_t)param;
+  lv_disp_t *disp = lv_disp_get_default();
+  if (!disp) return;
+
+  lv_disp_rot_t rot;
+  switch (rotation) {
+    case 1:  rot = LV_DISP_ROT_90;  break;
+    case 2:  rot = LV_DISP_ROT_180; break;
+    case 3:  rot = LV_DISP_ROT_270; break;
+    default: rot = LV_DISP_ROT_NONE; break;
+  }
+
+  lv_disp_rot_t old_rot = disp->driver->rotated;
+  if (old_rot == rot) return; /* nothing to do */
+
+  lv_disp_set_rotation(disp, rot);
+
+  /* Always resize the status bar to the (possibly new) screen width. */
+  if (status_bar && lv_obj_is_valid(status_bar)) {
+    lv_obj_set_width(status_bar, lv_disp_get_hor_res(disp));
+  }
+
+  /* Check if the aspect ratio changed (portrait ↔ landscape).
+   * 0°/180° keep the native portrait aspect; 90°/270° swap to landscape. */
+  bool old_landscape = (old_rot == LV_DISP_ROT_90  || old_rot == LV_DISP_ROT_270);
+  bool new_landscape = (rot    == LV_DISP_ROT_90  || rot    == LV_DISP_ROT_270);
+
+  if (old_landscape != new_landscape &&
+      dm.current_view && dm.current_view->root) {
+    View *v = dm.current_view;
+    if (v->destroy) v->destroy();
+    dm.current_view = NULL;
+    if (v->create) v->create();
+    dm.current_view = v;
+    if (v->get_hardwareinput_callback) {
+      v->get_hardwareinput_callback((void **)&dm.current_view->input_callback);
+    }
+  }
+
+  ESP_LOGI(TAG, "Display rotation set to %d° (aspect %s)",
+           rotation * 90,
+           (old_landscape != new_landscape) ? "changed – view rebuilt"
+                                            : "unchanged");
+}
+
+void display_manager_set_rotation(uint8_t rotation) {
+  display_manager_run_on_lvgl(set_rotation_on_lvgl, (void *)(uintptr_t)rotation);
+}
+
+void display_manager_start_auto_rotation(void) {
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  imu_auto_rotation_start();
+#else
+  ESP_LOGW(TAG, "Auto-rotation not supported on this platform");
+#endif
+}
+
+void display_manager_stop_auto_rotation(void) {
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  imu_auto_rotation_stop();
+#endif
 }
 
 
@@ -1225,6 +1559,7 @@ gpio_isr_handler_add(CONFIG_R_BTN, trackball_isr_right, NULL);
 ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
 #endif
 #ifndef CONFIG_JC3248W535EN_LCD
+#ifndef CONFIG_USE_WAVESHARE_AMOLED
   // Initialize I2C driver for touch functionality
 #ifdef CONFIG_USE_TDISPLAY_S3
   ESP_LOGI(TAG, "Initializing I2C for touch functionality");
@@ -1260,9 +1595,106 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
 #else
   lvgl_driver_init();
 #endif
+#endif // CONFIG_USE_WAVESHARE_AMOLED
 #endif // CONFIG_JC3248W535EN_LCD
 
-#if !defined(CONFIG_USE_7_INCHER) && !defined(CONFIG_JC3248W535EN_LCD)
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  // --- Waveshare ESP32-S3 1.8" AMOLED init ---
+  ESP_LOGI(TAG, "Initializing Waveshare AMOLED (RM67162 QSPI + CST816T)");
+
+  // Initialize I2C for TCA9554 + touch + IMU
+  i2c_config_t ws_i2c_cfg = {
+    .mode = I2C_MODE_MASTER,
+    .sda_io_num = WS_AMOLED_I2C_SDA,
+    .scl_io_num = WS_AMOLED_I2C_SCL,
+    .sda_pullup_en = GPIO_PULLUP_ENABLE,
+    .scl_pullup_en = GPIO_PULLUP_ENABLE,
+    .master.clk_speed = 400000,
+  };
+  esp_err_t i2c_ret = i2c_param_config(I2C_NUM_0, &ws_i2c_cfg);
+  if (i2c_ret != ESP_OK) {
+    ESP_LOGE(TAG, "WS I2C param_config failed: %s", esp_err_to_name(i2c_ret));
+  }
+  i2c_ret = i2c_driver_install(I2C_NUM_0, I2C_MODE_MASTER, 0, 0, 0);
+  if (i2c_ret != ESP_OK) {
+    ESP_LOGE(TAG, "WS I2C driver_install failed: %s", esp_err_to_name(i2c_ret));
+  }
+
+  // Initialize TCA9554 IO expander (controls display/touch power & reset)
+  {
+    uint8_t output_pins = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 7);
+    esp_err_t tca_ret = tca9554_set_pin_direction(output_pins, true);
+    if (tca_ret != ESP_OK) {
+      ESP_LOGE(TAG, "TCA9554 set_pin_direction failed: %s", esp_err_to_name(tca_ret));
+    } else {
+      // Reset cycle: pull low, wait, pull high
+      tca9554_set_pin_level(output_pins, false);
+      vTaskDelay(pdMS_TO_TICKS(200));
+      tca9554_set_pin_level(output_pins, true);
+      vTaskDelay(pdMS_TO_TICKS(100));
+      ESP_LOGI(TAG, "TCA9554 IO expander initialized OK");
+    }
+  }
+
+  // Initialize RM67162 QSPI display
+  rm67162_qspi_config_t qspi_cfg = {
+    .cs_gpio = WS_AMOLED_LCD_CS,
+    .sck_gpio = WS_AMOLED_LCD_SCK,
+    .d0_gpio = WS_AMOLED_LCD_D0,
+    .d1_gpio = WS_AMOLED_LCD_D1,
+    .d2_gpio = WS_AMOLED_LCD_D2,
+    .d3_gpio = WS_AMOLED_LCD_D3,
+    .reset_gpio = WS_AMOLED_LCD_RST,
+    .pclk_hz = 80 * 1000 * 1000,
+    .width = CONFIG_TFT_WIDTH,
+    .height = CONFIG_TFT_HEIGHT,
+    .spi_host = SPI2_HOST,
+  };
+  esp_err_t ret = rm67162_qspi_init(&qspi_cfg, &s_amoled_qspi_ctx, &s_amoled_panel);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "RM67162 QSPI init failed: %s", esp_err_to_name(ret));
+    return;
+  }
+  esp_lcd_panel_reset(s_amoled_panel);
+  esp_lcd_panel_init(s_amoled_panel);
+  esp_lcd_panel_disp_on_off(s_amoled_panel, true);
+  // Native portrait orientation (MADCTL=0x00): 368x448, no swap/mirror
+  // Runtime rotation handled by LVGL sw_rotate
+  ESP_LOGI(TAG, "RM67162 AMOLED initialized (%dx%d, native portrait)", CONFIG_TFT_WIDTH, CONFIG_TFT_HEIGHT);
+
+  // Wait for touch controller to stabilize after TCA9554 reset
+  vTaskDelay(pdMS_TO_TICKS(200));
+
+  // Initialize CST816T touch
+  cst816t_config_t touch_cfg = {
+    .i2c_port = I2C_NUM_0,
+    .i2c_addr = WS_AMOLED_TOUCH_ADDR,
+    .int_gpio = WS_AMOLED_TOUCH_INT,
+    .rst_gpio = GPIO_NUM_NC,
+    .width = CONFIG_TFT_WIDTH,
+    .height = CONFIG_TFT_HEIGHT,
+    .swap_xy = false,
+    .invert_x = false,
+    .invert_y = false,
+  };
+  ret = cst816t_init(&touch_cfg, &s_amoled_touch);
+  if (ret == ESP_OK) {
+    ESP_LOGI(TAG, "CST816T touch initialized");
+  } else {
+    ESP_LOGW(TAG, "CST816T touch init failed: %s", esp_err_to_name(ret));
+  }
+
+  // Initialize QMI8658 IMU accelerometer (optional — auto-rotation feature)
+  if (qmi8658_init(I2C_NUM_0) == ESP_OK) {
+    ESP_LOGI(TAG, "QMI8658 IMU ready for auto-rotation");
+  } else {
+    ESP_LOGW(TAG, "QMI8658 IMU not available (auto-rotation disabled)");
+  }
+
+  lv_init();
+#endif // CONFIG_USE_WAVESHARE_AMOLED
+
+#if !defined(CONFIG_USE_7_INCHER) && !defined(CONFIG_JC3248W535EN_LCD) && !defined(CONFIG_USE_WAVESHARE_AMOLED)
 /* For cardputer (no PSRAM) use a single smaller buffer to save internal RAM.
    Single buffer increases flush frequency but greatly reduces RAM usage. */
 #if defined(CONFIG_USE_CARDPUTER) || defined(CONFIG_USE_CARDPUTER_ADV)
@@ -1315,6 +1747,36 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
   disp_drv.flush_cb = invert_flush_cb;
   disp_drv.draw_buf = &disp_buf;
   lv_disp_drv_register(&disp_drv);
+
+#elif defined(CONFIG_USE_WAVESHARE_AMOLED)
+  {
+    // Use PSRAM double buffer for the 368-wide AMOLED
+    static lv_color_t *ws_buf1 = NULL;
+    static lv_color_t *ws_buf2 = NULL;
+    const int ws_buf_lines = 40;
+    size_t ws_buf_sz = CONFIG_TFT_WIDTH * ws_buf_lines * sizeof(lv_color_t);
+    ws_buf1 = (lv_color_t *)heap_caps_malloc(ws_buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    ws_buf2 = (lv_color_t *)heap_caps_malloc(ws_buf_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!ws_buf1 || !ws_buf2) {
+      ESP_LOGE(TAG, "Failed to allocate LVGL draw buffers in PSRAM");
+      return;
+    }
+
+    static lv_disp_draw_buf_t disp_buf;
+    lv_disp_draw_buf_init(&disp_buf, ws_buf1, ws_buf2, CONFIG_TFT_WIDTH * ws_buf_lines);
+
+    static lv_disp_drv_t disp_drv;
+    lv_disp_drv_init(&disp_drv);
+    disp_drv.hor_res = CONFIG_TFT_WIDTH;
+    disp_drv.ver_res = CONFIG_TFT_HEIGHT;
+    disp_drv.flush_cb = invert_flush_cb;
+    disp_drv.draw_buf = &disp_buf;
+    disp_drv.sw_rotate = 1;   // Enable LVGL software rotation
+    disp_drv.rotated = LV_DISP_ROT_NONE;  // Start in native portrait
+    lv_disp_drv_register(&disp_drv);
+    ESP_LOGI(TAG, "LVGL display registered (%dx%d, PSRAM double-buf %d lines, sw_rotate)",
+             CONFIG_TFT_WIDTH, CONFIG_TFT_HEIGHT, ws_buf_lines);
+  }
 
 #elif defined(CONFIG_JC3248W535EN_LCD)
   esp_err_t ret = lcd_axs15231b_init();
@@ -1440,6 +1902,16 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
   display_manager_init_success = true;
   last_touch_time = xTaskGetTickCount();
   is_backlight_dimmed = false;
+
+  // Apply saved display rotation (0-3 = manual, 4 = auto via IMU)
+  uint8_t saved_rotation = settings_get_display_rotation(&G_Settings);
+  if (saved_rotation == 4) {
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+    imu_auto_rotation_start();
+#endif
+  } else if (saved_rotation > 0 && saved_rotation <= 3) {
+    display_manager_set_rotation(saved_rotation);
+  }
 
   // override any floating state and force it on
   set_backlight_brightness(100);
@@ -2244,6 +2716,8 @@ void hardware_input_task(void *pvParameters) {
 
 #ifdef CONFIG_JC3248W535EN_LCD
     touch_driver_read_axs15231b(&touch_driver, &touch_data);
+#elif defined(CONFIG_USE_WAVESHARE_AMOLED)
+    waveshare_amoled_touch_read(&touch_driver, &touch_data);
 #else
     touch_driver_read(&touch_driver, &touch_data);
 #endif
@@ -2277,6 +2751,17 @@ void hardware_input_task(void *pvParameters) {
         if (xQueueSend(input_queue, &event, pdMS_TO_TICKS(10)) != pdTRUE) {
           ESP_LOGE(TAG, "Failed to send touch input to queue\n");
         }
+      }
+    } else if (touch_data.state == LV_INDEV_STATE_PR && touch_active) {
+      /* Continued press – send updated coordinates so drag/swipe is tracked */
+      last_touch_time = xTaskGetTickCount();
+      InputEvent event;
+      event.type = INPUT_TYPE_TOUCH;
+      event.data.touch_data.point.x = touch_data.point.x;
+      event.data.touch_data.point.y = touch_data.point.y;
+      event.data.touch_data.state = touch_data.state;
+      if (xQueueSend(input_queue, &event, pdMS_TO_TICKS(10)) != pdTRUE) {
+        ESP_LOGE(TAG, "Failed to send continued touch to queue\n");
       }
     } else if (touch_data.state == LV_INDEV_STATE_REL && touch_active) {
       last_touch_time = xTaskGetTickCount();

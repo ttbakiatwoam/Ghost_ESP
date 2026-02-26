@@ -318,13 +318,13 @@ esp_err_t sd_card_init(void) {
   sdmmc_slot_config_t slot_config = SDMMC_SLOT_CONFIG_DEFAULT();
   slot_config.width = 1;
 
-  slot_config.clk = CONFIG_SD_MMC_CLK;
-  slot_config.cmd = CONFIG_SD_MMC_CMD;
-  slot_config.d0 = CONFIG_SD_MMC_D0;
+  slot_config.clk = sd_card_manager.clkpin;
+  slot_config.cmd = sd_card_manager.cmdpin;
+  slot_config.d0 = sd_card_manager.d0pin;
 
-  gpio_set_pull_mode(CONFIG_SD_MMC_D0, GPIO_PULLUP_ONLY);  // CLK
-  gpio_set_pull_mode(CONFIG_SD_MMC_CLK, GPIO_PULLUP_ONLY); // CMD
-  gpio_set_pull_mode(CONFIG_SD_MMC_CMD, GPIO_PULLUP_ONLY); // D0
+  gpio_set_pull_mode(sd_card_manager.d0pin, GPIO_PULLUP_ONLY);  // D0
+  gpio_set_pull_mode(sd_card_manager.clkpin, GPIO_PULLUP_ONLY); // CLK
+  gpio_set_pull_mode(sd_card_manager.cmdpin, GPIO_PULLUP_ONLY); // CMD
 
   slot_config.gpio_cd = GPIO_NUM_NC; // Disable Card Detect pin
   slot_config.gpio_wp = GPIO_NUM_NC; // Disable Write Protect pin
