@@ -4,7 +4,7 @@
 
 #include "managers/display_manager.h"
 
-#define NUM_BARS 15
+#define NUM_BARS 10
 
 typedef struct {
   lv_obj_t *track_label;

@@ -95,10 +95,11 @@ void music_visualizer_view_create() {
     artist_label_font = &lv_font_montserrat_16;
   }
 
-  int label_x_offset = LV_HOR_RES / 12;
+  int label_x_offset = 10;
   int label_y_offset = LV_VER_RES / 8;
-  int bar_width = LV_HOR_RES / (NUM_BARS * 2);
-  int bar_spacing = LV_HOR_RES / (NUM_BARS + 2);
+  int avail_w = LV_HOR_RES - 20;  // 10px padding each side
+  int bar_spacing = avail_w / NUM_BARS;  // even distribution across width
+  int bar_width = bar_spacing > 4 ? bar_spacing - 4 : bar_spacing; // 4px gap
   int bar_y_offset = LV_VER_RES / 4;
 
   view.track_label = lv_label_create(content);
@@ -119,9 +120,11 @@ void music_visualizer_view_create() {
 
   for (int i = 0; i < NUM_BARS; i++) {
     view.bars[i] = lv_obj_create(content);
+    lv_obj_remove_style_all(view.bars[i]);
+    lv_obj_clear_flag(view.bars[i], LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(view.bars[i], bar_width, 1);
     lv_obj_align(view.bars[i], LV_ALIGN_BOTTOM_LEFT,
-                 label_x_offset + (bar_spacing * i), -bar_y_offset);
+                 10 + (bar_spacing * i), -bar_y_offset);
 
     lv_obj_set_style_radius(view.bars[i], 0, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(view.bars[i], LV_OPA_COVER, LV_PART_MAIN);
@@ -132,14 +135,18 @@ void music_visualizer_view_create() {
     lv_obj_set_style_bg_grad_dir(view.bars[i], LV_GRAD_DIR_VER, LV_PART_MAIN);
   }
 
+  int content_h = LV_VER_RES - GUI_STATUS_BAR_HEIGHT;
   for (int i = 0; i < NUM_PARTICLES; i++) {
     particles[i].obj = lv_obj_create(content);
-    lv_obj_set_size(particles[i].obj, 1, 1);
+    lv_obj_remove_style_all(particles[i].obj);
+    lv_obj_clear_flag(particles[i].obj, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_size(particles[i].obj, 2, 2);
     lv_obj_set_style_radius(particles[i].obj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
+    lv_obj_set_style_bg_opa(particles[i].obj, LV_OPA_COVER, LV_PART_MAIN);
     lv_obj_set_style_bg_color(particles[i].obj, lv_color_white(), LV_PART_MAIN);
 
     particles[i].x = 0;
-    particles[i].y = rand() % LV_VER_RES;
+    particles[i].y = rand() % content_h;
     particles[i].velocity = 1 + rand() % 3;
     lv_obj_align(particles[i].obj, LV_ALIGN_TOP_LEFT, particles[i].x,
                  particles[i].y);
@@ -157,15 +164,35 @@ static void animation_timer_callback(lv_timer_t *timer) {
 
   if (dataAvailable) {
     for (int i = 0; i < NUM_BARS; i++) {
-      lv_obj_set_height(view.bars[i], amplitudeData.bars[i]);
+      target_amplitudes[i] = amplitudeData.bars[i];
+    }
+  } else {
+    /* Self-animating demo mode: randomly pick new target heights so the
+     * visualizer looks alive even without Bluetooth audio data. */
+    for (int i = 0; i < NUM_BARS; i++) {
+      if (rand() % 6 == 0) { /* ~17 % chance per tick per bar */
+        int max_h = (LV_VER_RES - GUI_STATUS_BAR_HEIGHT) / 2;
+        target_amplitudes[i] = 10 + rand() % (max_h > 10 ? max_h : 20);
+      }
+      /* Gravity: targets slowly decay toward zero */
+      if (target_amplitudes[i] > 2) target_amplitudes[i] -= 1;
     }
   }
 
+  /* Smooth interpolation toward targets */
+  for (int i = 0; i < NUM_BARS; i++) {
+    int diff = target_amplitudes[i] - current_amplitudes[i];
+    current_amplitudes[i] += diff / 4 + (diff > 0 ? 1 : (diff < 0 ? -1 : 0));
+    if (current_amplitudes[i] < 1) current_amplitudes[i] = 1;
+    lv_obj_set_height(view.bars[i], current_amplitudes[i]);
+  }
+
+  int content_h = LV_VER_RES - GUI_STATUS_BAR_HEIGHT;
   for (int i = 0; i < NUM_PARTICLES; i++) {
     particles[i].x += particles[i].velocity;
     if (particles[i].x > LV_HOR_RES) {
       particles[i].x = 0;
-      particles[i].y = rand() % LV_VER_RES;
+      particles[i].y = rand() % content_h;
       particles[i].velocity = 1 + rand() % 3;
     }
     lv_obj_set_pos(particles[i].obj, particles[i].x, particles[i].y);
