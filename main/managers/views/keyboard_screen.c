@@ -639,6 +639,7 @@ static void keyboard_create() {
     is_symbols_mode = false;
     input_len = 0;
     memset(input_buffer, 0, sizeof(input_buffer));
+    kb_touch_active = false; // reset stale flag from prior session
 
     int screen_height = LV_VER_RES;
     int status_bar_height = GUI_STATUS_BAR_HEIGHT;
@@ -931,7 +932,6 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
     } else if (event->type == INPUT_TYPE_TOUCH && event->data.touch_data.state == LV_INDEV_STATE_PR) {
         /* Only process the first PR event per touch; ignore continued presses */
         if (kb_touch_active) return;
-        kb_touch_active = true;
         int touch_x = event->data.touch_data.point.x;
         int touch_y = event->data.touch_data.point.y;
         ESP_LOGD(TAG, "touch PR x=%d y=%d", touch_x, touch_y);
@@ -951,6 +951,10 @@ static void handle_hardware_button_press_keyboard(InputEvent *event) {
             km_w = lv_obj_get_width(key_matrix);
             km_h = lv_obj_get_height(key_matrix);
             if (touch_y < km_y || touch_y >= km_y + km_h || touch_x < km_x || touch_x >= km_x + km_w) return;
+        }
+        /* Bounds validated — commit to processing this touch */
+        kb_touch_active = true;
+        if (key_matrix) {
             int row_h = km_h / num_rows;
             if (row_h <= 0) row_h = 1;
             row = (touch_y - km_y) / row_h;

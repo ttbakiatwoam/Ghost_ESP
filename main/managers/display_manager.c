@@ -262,7 +262,7 @@ static int16_t s_touch_last_y = 0;
  *    confirmed release we ignore new presses for TOUCH_COOLDOWN_MS.
  */
 #define TOUCH_RELEASE_FRAMES  3
-#define TOUCH_COOLDOWN_MS   300
+#define TOUCH_COOLDOWN_MS   150
 
 static int      s_touch_rel_count  = 0;
 static bool     s_touch_pressed    = false;

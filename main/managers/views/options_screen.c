@@ -433,7 +433,7 @@ static int opt_touch_start_y;
 static bool opt_touch_started = false;
 static bool opt_back_primed = false;      /* true when press started inside back_btn */
 static uint32_t last_back_ms = 0;          /* cooldown for back_event_cb */
-#define BACK_BTN_COOLDOWN_MS 400
+#define BACK_BTN_COOLDOWN_MS 200
 #if CONFIG_LV_TOUCH_CONTROLLER_XPT2046
 static const int OPT_SWIPE_THRESHOLD_RATIO = 1;
 #else
