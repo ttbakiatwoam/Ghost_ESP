@@ -29,6 +29,15 @@ esp_err_t esp_lcd_new_panel_rm67162(void *qspi_ctx,
                                     const esp_lcd_panel_dev_config_t *panel_dev_config,
                                     esp_lcd_panel_handle_t *ret_panel);
 
+/**
+ * @brief Set hardware rotation on the RM67162/SH8601 panel via MADCTL.
+ *
+ * @param panel   Panel handle from esp_lcd_new_panel_rm67162()
+ * @param rotation  0 = 0°, 1 = 90° CW, 2 = 180°, 3 = 270° CW
+ * @return ESP_OK on success
+ */
+esp_err_t esp_lcd_panel_rm67162_set_rotation(esp_lcd_panel_handle_t panel, uint8_t rotation);
+
 #ifdef __cplusplus
 }
 #endif

@@ -299,3 +299,29 @@ static esp_err_t panel_rm67162_disp_on_off(esp_lcd_panel_t *panel, bool on_off)
     rm67162_qspi_tx_param(qspi_ctx, command, NULL, 0);
     return ESP_OK;
 }
+
+esp_err_t esp_lcd_panel_rm67162_set_rotation(esp_lcd_panel_handle_t panel, uint8_t rotation)
+{
+    rm67162_panel_t *rm67162 = __containerof(panel, rm67162_panel_t, base);
+    void *qspi_ctx = rm67162->qspi_ctx;
+
+    /* Preserve non-rotation bits (e.g. BGR) and set rotation via MY/MX/MV */
+    uint8_t madctl = rm67162->madctl_val & ~(LCD_CMD_MADCTL_MY | LCD_CMD_MADCTL_MX | LCD_CMD_MADCTL_MV);
+    switch (rotation) {
+        case 0:  /* 0°   — native portrait */
+            break;
+        case 1:  /* 90°  CW */
+            madctl |= LCD_CMD_MADCTL_MV | LCD_CMD_MADCTL_MX;
+            break;
+        case 2:  /* 180° */
+            madctl |= LCD_CMD_MADCTL_MX | LCD_CMD_MADCTL_MY;
+            break;
+        case 3:  /* 270° CW */
+            madctl |= LCD_CMD_MADCTL_MV | LCD_CMD_MADCTL_MY;
+            break;
+    }
+    rm67162->madctl_val = madctl;
+    rm67162_qspi_tx_param(qspi_ctx, LCD_CMD_MADCTL, &rm67162->madctl_val, 1);
+    ESP_LOGI(TAG, "Panel MADCTL set to 0x%02X (rotation=%d)", madctl, rotation);
+    return ESP_OK;
+}

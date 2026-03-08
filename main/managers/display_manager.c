@@ -1013,6 +1013,13 @@ static void set_rotation_on_lvgl(void *param) {
   lv_disp_rot_t old_rot = disp->driver->rotated;
   if (old_rot == rot) return; /* nothing to do */
 
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  /* Hardware rotation via panel MADCTL — update the panel first, then inform
+   * LVGL about the new logical dimensions.  sw_rotate is disabled so LVGL
+   * renders directly in the rotated coordinate space and the panel controller
+   * handles the physical pixel mapping. */
+  esp_lcd_panel_rm67162_set_rotation(s_amoled_panel, rotation);
+#endif
   lv_disp_set_rotation(disp, rot);
 
   /* Always resize the status bar to the (possibly new) screen width. */
@@ -1767,10 +1774,10 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
     disp_drv.ver_res = CONFIG_TFT_HEIGHT;
     disp_drv.flush_cb = invert_flush_cb;
     disp_drv.draw_buf = &disp_buf;
-    disp_drv.sw_rotate = 1;   // Enable LVGL software rotation
+    disp_drv.sw_rotate = 0;   // Hardware rotation via panel MADCTL
     disp_drv.rotated = LV_DISP_ROT_NONE;  // Start in native portrait
     lv_disp_drv_register(&disp_drv);
-    ESP_LOGI(TAG, "LVGL display registered (%dx%d, PSRAM double-buf %d lines, sw_rotate)",
+    ESP_LOGI(TAG, "LVGL display registered (%dx%d, PSRAM double-buf %d lines, hw_rotate)",
              CONFIG_TFT_WIDTH, CONFIG_TFT_HEIGHT, ws_buf_lines);
   }
 
@@ -2816,6 +2823,59 @@ void hardware_input_task(void *pvParameters) {
   vTaskDelete(NULL);
 }
 
+/* ---- Swipe-up-from-bottom → go home gesture tracking ---- */
+#define SWIPE_HOME_BOTTOM_PCT  15   /* bottom 15 % of screen is the start zone */
+#define SWIPE_HOME_MIN_DY      50   /* minimum upward pixel delta               */
+
+static bool    swipe_tracking  = false;
+static int16_t swipe_start_x   = 0;
+static int16_t swipe_start_y   = 0;
+
+/**
+ * Check if a touch event constitutes a swipe-up-from-bottom "go home" gesture.
+ * Returns true (and triggers the view switch) if the gesture is detected,
+ * in which case the caller should NOT forward the event to the view.
+ */
+static bool check_swipe_home(InputEvent *ev) {
+  if (ev->type != INPUT_TYPE_TOUCH) return false;
+
+  lv_disp_t *disp = lv_disp_get_default();
+  if (!disp) return false;
+
+  int16_t tx = ev->data.touch_data.point.x;
+  int16_t ty = ev->data.touch_data.point.y;
+
+  if (ev->data.touch_data.state == LV_INDEV_STATE_PR) {
+    if (!swipe_tracking) {
+      /* First press — record start position */
+      swipe_tracking = true;
+      swipe_start_x  = tx;
+      swipe_start_y  = ty;
+    }
+    return false; /* always forward press events to the view */
+  }
+
+  if (ev->data.touch_data.state == LV_INDEV_STATE_REL && swipe_tracking) {
+    swipe_tracking = false;
+
+    lv_coord_t ver = lv_disp_get_ver_res(disp);
+    int16_t threshold_y = ver - (ver * SWIPE_HOME_BOTTOM_PCT / 100);
+    int16_t dy = swipe_start_y - ty;  /* positive = upward */
+
+    if (swipe_start_y >= threshold_y && dy >= SWIPE_HOME_MIN_DY) {
+      /* Don't navigate if we're already on the main menu */
+      if (dm.current_view != &main_menu_view) {
+        ESP_LOGI(TAG, "Swipe-up-from-bottom detected — going home "
+                      "(start_y=%d dy=%d threshold=%d)",
+                 swipe_start_y, dy, threshold_y);
+        display_manager_switch_view(&main_menu_view);
+        return true;  /* consume the event */
+      }
+    }
+  }
+  return false;
+}
+
 void processEvent() {
   // do not process events until the display manager is up
   if (!display_manager_init_success) {
@@ -2848,7 +2908,8 @@ void processEvent() {
       xSemaphoreGive(dm.mutex);
 
       ESP_LOGD(TAG, "Input event type: %d, Current view: %s\n", event.type, view_name);
-      if (input_callback) input_callback(&event);
+      if (!check_swipe_home(&event) && input_callback)
+        input_callback(&event);
     }
     processed++;
   }
@@ -2876,7 +2937,8 @@ void processEvent() {
         xSemaphoreGive(dm.mutex);
 
         ESP_LOGD(TAG, "Input event type: %d, Current view: %s\n", event.type, view_name);
-        if (input_callback) input_callback(&event);
+        if (!check_swipe_home(&event) && input_callback)
+          input_callback(&event);
       }
     }
   }

@@ -1,5 +1,6 @@
 #include "managers/views/music_visualizer.h"
 #include "managers/views/main_menu_screen.h"
+#include "vendor/drivers/ws_audio.h"
 #include <freertos/FreeRTOS.h>
 #include <freertos/queue.h>
 #include <lvgl.h>
@@ -99,7 +100,12 @@ void music_visualizer_view_create() {
   int label_y_offset = LV_VER_RES / 8;
   int avail_w = LV_HOR_RES - 20;  // 10px padding each side
   int bar_spacing = avail_w / NUM_BARS;  // even distribution across width
-  int bar_width = bar_spacing > 4 ? bar_spacing - 4 : bar_spacing; // 4px gap
+  int gap = (bar_spacing > 6) ? 4 : 2;   // gap between bars
+  int bar_width = bar_spacing - gap;
+  if (bar_width < 2) bar_width = 2;
+  /* Centre the bar group horizontally */
+  int total_w = bar_spacing * NUM_BARS;
+  int bar_x_start = (LV_HOR_RES - total_w) / 2;
   int bar_y_offset = LV_VER_RES / 4;
 
   view.track_label = lv_label_create(content);
@@ -124,7 +130,7 @@ void music_visualizer_view_create() {
     lv_obj_clear_flag(view.bars[i], LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_size(view.bars[i], bar_width, 1);
     lv_obj_align(view.bars[i], LV_ALIGN_BOTTOM_LEFT,
-                 10 + (bar_spacing * i), -bar_y_offset);
+                 bar_x_start + (bar_spacing * i), -bar_y_offset);
 
     lv_obj_set_style_radius(view.bars[i], 0, LV_PART_MAIN);
     lv_obj_set_style_bg_opa(view.bars[i], LV_OPA_COVER, LV_PART_MAIN);
@@ -155,6 +161,11 @@ void music_visualizer_view_create() {
   amplitudeQueue = xQueueCreate(10, sizeof(AmplitudeData));
   animation_timer =
       lv_timer_create(animation_timer_callback, ANIMATION_INTERVAL_MS, NULL);
+
+  /* Start microphone capture → amplitude data will flow into amplitudeQueue */
+  if (ws_audio_init() == ESP_OK) {
+    ws_audio_start();
+  }
 }
 
 static void animation_timer_callback(lv_timer_t *timer) {
@@ -220,6 +231,8 @@ void music_visualizer_view_update(const uint8_t *amplitudes,
 }
 
 void music_visualizer_destroy(void) {
+
+  ws_audio_stop();
 
   lvgl_timer_del_safe(&animation_timer);
 
