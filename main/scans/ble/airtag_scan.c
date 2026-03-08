@@ -35,7 +35,7 @@
 #endif
 
 // RSSI log interval to avoid spamming logs
-#define AIRTAG_RSSI_LOG_INTERVAL_MS 3000
+#define AIRTAG_RSSI_LOG_INTERVAL_MS 5000
 
 // Module tag for logging
 static const char *TAG = "AirTagScan";
@@ -114,21 +114,12 @@ static int find_airtag_by_addr(const ble_addr_t *addr) {
  * @param total Total count of discovered AirTags
  * @param mac MAC address string
  * @param rssi RSSI value
- * @param payload Payload data
- * @param payload_len Length of payload
  */
-static void log_airtag_discovery(int idx, int total, const char *mac, int8_t rssi,
-                                  const uint8_t *payload, size_t payload_len) {
+static void log_airtag_discovery(int idx, int total, const char *mac, int8_t rssi) {
     glog("[%d] AirTag Found (Total: %d)\n"
          "     MAC: %s,\n"
          "     RSSI: %d dBm (%s),\n",
          idx, total, mac, rssi, rssi_to_proximity(rssi));
-    
-    if (payload && payload_len > 0) {
-        char hex_buf[256];
-        format_hex_bytes(payload, payload_len, hex_buf, sizeof(hex_buf), ' ');
-        glog("     Payload: %s\n", hex_buf);
-    }
 }
 
 /**
@@ -159,6 +150,7 @@ static void log_airtag_rssi_update(int idx, const char *mac, int8_t rssi) {
  * @param len Length of event data
  */
 static void airtag_scanner_callback(struct ble_gap_event *event, size_t len) {
+    (void)len;
     if (!airtag_scan_active || event->type != BLE_GAP_EVENT_DISC) {
         return;
     }
@@ -207,10 +199,9 @@ static void airtag_scanner_callback(struct ble_gap_event *event, size_t len) {
     char macAddress[18];
     format_mac_address(event->disc.addr.val, macAddress, sizeof(macAddress), false);
     log_airtag_discovery(discovered_airtag_count, discovered_airtag_count + 1,
-                         macAddress, event->disc.rssi, payload, payload_len);
+                         macAddress, event->disc.rssi);
     
     discovered_airtag_count++;
-    pulse_once(&rgb_manager, 0, 0, 255);
 }
 
 // ============================================================================

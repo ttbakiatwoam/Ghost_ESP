@@ -56,6 +56,9 @@ static volatile bool airtag_scanner_active = false;
 static esp_timer_handle_t flush_timer = NULL;
 static TaskHandle_t nimble_host_task_handle = NULL;
 static SemaphoreHandle_t nimble_host_exit_sem = NULL;
+static SemaphoreHandle_t ble_disc_complete_sem = NULL;
+static volatile bool ble_pending_clear = false;
+static volatile bool ble_cb_busy = false;
 static uint32_t ble_pcap_packet_count = 0;
 static uint32_t ble_pcap_event_total_count = 0;
 
@@ -73,6 +76,38 @@ static void ble_on_reset(int reason);
 static void ble_suspend_networking(void);
 static void ble_resume_networking(void);
 static bool wait_for_ble_ready(void);
+static bool ble_wait_for_scan_stop(uint32_t timeout_ms);
+static bool ble_wait_for_callbacks_idle(uint32_t timeout_ms);
+
+static bool ble_wait_for_scan_stop(uint32_t timeout_ms) {
+    if (!ble_gap_disc_active()) {
+        return true;
+    }
+
+    if (ble_disc_complete_sem != NULL) {
+        if (xSemaphoreTake(ble_disc_complete_sem, pdMS_TO_TICKS(timeout_ms)) == pdTRUE) {
+            return !ble_gap_disc_active();
+        }
+    }
+
+    uint32_t waited_ms = 0;
+    while (ble_gap_disc_active() && waited_ms < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(20));
+        waited_ms += 20;
+    }
+
+    return !ble_gap_disc_active();
+}
+
+static bool ble_wait_for_callbacks_idle(uint32_t timeout_ms) {
+    uint32_t waited_ms = 0;
+    while (ble_cb_busy && waited_ms < timeout_ms) {
+        vTaskDelay(pdMS_TO_TICKS(10));
+        waited_ms += 10;
+    }
+
+    return !ble_cb_busy;
+}
 
 typedef struct {
     ble_data_handler_t handler;
@@ -117,6 +152,13 @@ int ble_gap_event_general(struct ble_gap_event *event, void *arg) {
     }
 
     if (event->type == BLE_GAP_EVENT_DISC) {
+        ble_cb_busy = true;
+
+        if (ble_pending_clear) {
+            ble_cb_busy = false;
+            return 0;
+        }
+
         static uint32_t disc_log_counter = 0;
         disc_log_counter++;
         if ((disc_log_counter % 50) == 1) {
@@ -127,6 +169,11 @@ int ble_gap_event_general(struct ble_gap_event *event, void *arg) {
                      (unsigned int)event->disc.length_data);
         }
         notify_handlers(event, event->disc.length_data);
+        ble_cb_busy = false;
+    } else if (event->type == BLE_GAP_EVENT_DISC_COMPLETE) {
+        if (ble_disc_complete_sem != NULL) {
+            xSemaphoreGive(ble_disc_complete_sem);
+        }
     }
 
     return 0;
@@ -272,6 +319,17 @@ static void restart_ble_stack(void) {
         ble_gap_adv_stop();
     }
     
+    ble_pending_clear = true;
+    if (ble_disc_complete_sem != NULL) {
+        (void)xSemaphoreTake(ble_disc_complete_sem, 0);
+    }
+
+    if (ble_gap_disc_active()) {
+        (void)ble_gap_disc_cancel();
+        (void)ble_wait_for_scan_stop(1200);
+    }
+    (void)ble_wait_for_callbacks_idle(1200);
+
     // Stop the NimBLE stack and wait for the host task to signal exit via semaphore
     nimble_port_stop();
     if (nimble_host_task_handle != NULL && nimble_host_exit_sem != NULL) {
@@ -302,6 +360,7 @@ static void restart_ble_stack(void) {
         size_t free_dma_after_re = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
         size_t largest_dma_after_re = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT | MALLOC_CAP_DMA);
         ESP_LOGI(TAG_BLE, "reinit post-fail dma-ram: free=%d bytes (largest block=%d)", (int)free_dma_after_re, (int)largest_dma_after_re);
+        ble_pending_clear = false;
         return;
     }
 
@@ -312,6 +371,8 @@ static void restart_ble_stack(void) {
 
     // Restart the NimBLE host task (larger stack)
     xTaskCreate(nimble_host_task, "nimble_host", NIMBLE_HOST_TASK_STACK_SIZE, NULL, 5, &nimble_host_task_handle);
+
+    ble_pending_clear = false;
     
     // Wait for NimBLE stack to be ready
     vTaskDelay(pdMS_TO_TICKS(100));
@@ -327,13 +388,23 @@ void stop_ble_stack() {
         ESP_LOGE(TAG_BLE, "Error stopping advertisement");
     }
 
+    ble_pending_clear = true;
+    if (ble_gap_disc_active()) {
+        (void)ble_gap_disc_cancel();
+        (void)ble_wait_for_scan_stop(1200);
+    }
+    (void)ble_wait_for_callbacks_idle(1200);
+
     rc = nimble_port_stop();
     if (rc != 0) {
         ESP_LOGE(TAG_BLE, "Error stopping NimBLE port");
+        ble_pending_clear = false;
         return;
     }
 
     nimble_port_deinit();
+
+    ble_pending_clear = false;
 
     ESP_LOGI(TAG_BLE, "NimBLE stack and task deinitialized.");
 }
@@ -440,8 +511,6 @@ void detect_ble_spam_callback(struct ble_gap_event *event, size_t length) {
         if (spam_counter > MAX_PAYLOADS) {
             ESP_LOGW(TAG_BLE, "BLE Spam detected! Company ID: 0x%04X", current_company_id);
             TERMINAL_VIEW_ADD_TEXT("BLE Spam detected! Company ID: 0x%04X\n", current_company_id);
-            // pulse rgb purple once when spam is detected
-            pulse_once(&rgb_manager, 128, 0, 128);
             spam_counter = 0;
         }
     } else {
@@ -515,9 +584,6 @@ void airtag_scanner_callback(struct ble_gap_event *event, size_t len) {
                 discovered_airtag_count++;
                 airTagCount++; // Increment the original counter too, maybe rename it later
                 airtag_last_rssi_log[discovered_airtag_count - 1] = xTaskGetTickCount();
-
-                // pulse rgb blue once when a *new* air tag is found
-            pulse_once(&rgb_manager, 0, 0, 255);
 
             char macAddress[18];
             format_mac_address(event->disc.addr.val, macAddress, sizeof(macAddress), false);
@@ -593,7 +659,7 @@ static bool wait_for_ble_ready(void) {
     return true;
 }
 
-void ble_start_scanning(void) {
+bool ble_start_scanning(void) {
     if (!ble_initialized) {
         ble_init();
     }
@@ -602,12 +668,22 @@ void ble_start_scanning(void) {
         ESP_LOGE(TAG_BLE, "BLE stack not ready");
         TERMINAL_VIEW_ADD_TEXT("BLE stack not ready\n");
         status_display_show_status("BLE Not Ready");
-        return;
+        return false;
     }
 
     if (ble_gap_disc_active()) {
-        ble_gap_disc_cancel();
-        vTaskDelay(pdMS_TO_TICKS(50));
+        if (ble_disc_complete_sem != NULL) {
+            (void)xSemaphoreTake(ble_disc_complete_sem, 0);
+        }
+        (void)ble_gap_disc_cancel();
+        (void)ble_wait_for_scan_stop(800);
+    }
+
+    if (ble_disc_complete_sem == NULL) {
+        ble_disc_complete_sem = xSemaphoreCreateBinary();
+    }
+    if (ble_disc_complete_sem != NULL) {
+        (void)xSemaphoreTake(ble_disc_complete_sem, 0);
     }
 
     struct ble_gap_disc_params disc_params = {0};
@@ -630,10 +706,12 @@ void ble_start_scanning(void) {
         ESP_LOGE(TAG_BLE, "Error starting BLE scan");
         TERMINAL_VIEW_ADD_TEXT("Error starting BLE scan\n");
         status_display_show_status("BLE Scan Fail");
+        return false;
     } else {
         ESP_LOGI(TAG_BLE, "Scanning started...");
         TERMINAL_VIEW_ADD_TEXT("Scanning started...\n");
         status_display_show_status("BLE Scanning");
+        return true;
     }
 }
 
@@ -729,6 +807,10 @@ void ble_init(void) {
             nimble_host_exit_sem = xSemaphoreCreateBinary();
         }
 
+        if (ble_disc_complete_sem == NULL) {
+            ble_disc_complete_sem = xSemaphoreCreateBinary();
+        }
+
         // Configure and start the NimBLE host task (larger stack to avoid overflow on S3)
         xTaskCreate(nimble_host_task, "nimble_host", NIMBLE_HOST_TASK_STACK_SIZE, NULL, 5, &nimble_host_task_handle);
         
@@ -746,7 +828,35 @@ void ble_init(void) {
 
 void ble_deinit(void) {
     if (ble_initialized) {
+        ble_spam_stop();
+        ble_stop_spoofing();
+        if (flipper_scan_is_active()) {
+            flipper_scan_stop();
+        }
+        if (airtag_scan_is_active()) {
+            airtag_scan_stop();
+        }
+        if (gatt_scan_is_active()) {
+            gatt_scan_stop();
+        }
+
         handler_count = 0;
+
+        ble_pending_clear = true;
+        if (ble_disc_complete_sem != NULL) {
+            (void)xSemaphoreTake(ble_disc_complete_sem, 0);
+        }
+
+        if (ble_gap_disc_active()) {
+            (void)ble_gap_disc_cancel();
+            if (!ble_wait_for_scan_stop(1200)) {
+                ESP_LOGW(TAG_BLE, "ble_deinit: scan did not stop before timeout");
+            }
+        }
+
+        if (!ble_wait_for_callbacks_idle(1200)) {
+            ESP_LOGW(TAG_BLE, "ble_deinit: callbacks still busy before host stop");
+        }
 
         vTaskDelay(pdMS_TO_TICKS(100));
 
@@ -778,6 +888,8 @@ void ble_deinit(void) {
 
         ble_stack_ready = false;
         ble_initialized = false;
+        ble_pending_clear = false;
+        ble_cb_busy = false;
         ESP_LOGI(TAG_BLE, "BLE deinitialized successfully.");
         TERMINAL_VIEW_ADD_TEXT("BLE deinitialized successfully.\n");
 
@@ -856,19 +968,41 @@ void ble_stop(void) {
     ble_pcap_packet_count = 0;
     ble_pcap_event_total_count = 0;
 
-    // Stop spoofing if it was active
+    ble_spam_stop();
     ble_stop_spoofing();
 
-    int rc = ble_gap_disc_cancel();
+    if (flipper_scan_is_active()) {
+        flipper_scan_stop();
+    }
+    if (airtag_scan_is_active()) {
+        airtag_scan_stop();
+    }
+    if (gatt_scan_is_active()) {
+        gatt_scan_stop();
+    }
 
-    vTaskDelay(pdMS_TO_TICKS(100));
+    ble_pending_clear = true;
+    if (ble_disc_complete_sem != NULL) {
+        (void)xSemaphoreTake(ble_disc_complete_sem, 0);
+    }
+
+    int rc = ble_gap_disc_cancel();
+    bool scan_stopped = ble_wait_for_scan_stop(1200);
+
+    if (!ble_wait_for_callbacks_idle(1200)) {
+        ESP_LOGW(TAG_BLE, "ble_stop: callbacks still busy after scan cancel");
+    }
 
     switch (rc) {
     case 0:
         if (!pcap_is_wireshark_mode()) {
-            glog("BLE scan stopped successfully.\n");
+            if (scan_stopped) {
+                glog("BLE scan stopped successfully.\n");
+            } else {
+                glog("BLE scan cancel requested, but scan still active after timeout.\n");
+            }
         }
-        status_display_show_status("BLE Stopped");
+        status_display_show_status(scan_stopped ? "BLE Stopped" : "BLE Stop Wait");
         break;
     case BLE_HS_EBUSY:
         if (!pcap_is_wireshark_mode()) {
@@ -996,7 +1130,12 @@ void ble_start_capture(void) {
     }
 
     // Register BLE handler only after file is open
-    ble_register_handler(ble_pcap_callback);
+    err = ble_register_handler(ble_pcap_callback);
+    if (err != ESP_OK) {
+        ESP_LOGE("BLE_PCAP", "Failed to register BLE capture handler: %s", esp_err_to_name(err));
+        pcap_file_close();
+        return;
+    }
 
     // Create a timer to flush the buffer periodically
     esp_timer_create_args_t timer_args = {.callback = (esp_timer_cb_t)pcap_flush_buffer_to_file,
@@ -1006,7 +1145,16 @@ void ble_start_capture(void) {
         esp_timer_start_periodic(flush_timer, 1000000); // Flush every second
     }
 
-    ble_start_scanning();
+    if (!ble_start_scanning()) {
+        ble_unregister_handler(ble_pcap_callback);
+        if (flush_timer != NULL) {
+            esp_timer_stop(flush_timer);
+            esp_timer_delete(flush_timer);
+            flush_timer = NULL;
+        }
+        pcap_file_close();
+        return;
+    }
     status_display_show_status("BLE Capture On");
 }
 
@@ -1031,7 +1179,11 @@ void ble_start_capture_wireshark(void) {
     }
 
     /* Register BLE handler to emit HCI packets into the PCAP buffer */
-    ble_register_handler(ble_pcap_callback);
+    esp_err_t err = ble_register_handler(ble_pcap_callback);
+    if (err != ESP_OK) {
+        ESP_LOGE("BLE_PCAP", "Failed to register BLE wireshark handler: %s", esp_err_to_name(err));
+        return;
+    }
 
     /* Flush more frequently for better live capture latency */
     esp_timer_create_args_t timer_args = {.callback = (esp_timer_cb_t)pcap_flush_buffer_to_file,
@@ -1041,7 +1193,15 @@ void ble_start_capture_wireshark(void) {
         esp_timer_start_periodic(flush_timer, 200000);
     }
 
-    ble_start_scanning();
+    if (!ble_start_scanning()) {
+        ble_unregister_handler(ble_pcap_callback);
+        if (flush_timer != NULL) {
+            esp_timer_stop(flush_timer);
+            esp_timer_delete(flush_timer);
+            flush_timer = NULL;
+        }
+        return;
+    }
     status_display_show_status("BLE Wireshark");
 }
 

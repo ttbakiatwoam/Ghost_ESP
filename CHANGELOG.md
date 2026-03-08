@@ -2,34 +2,120 @@
 
 
 
+## Revival v1.9.5
+
+### Added
+- Added auto saving of coredumps and cli commands for debugging - @tototo31
+- Add NRF24 native + ghostlink support for The Wired Hatter's Banshee with a frequency analyzer
+
+### Changed
+- Wardriving dedupe now includes APs when RSSI differs lower or higher for better trilateration support
+- Wardriving screen now shows `GPS Stale` when GPS data stops refreshing
+- The Wired Hatter's Banshee GPS routing now uses S3 UART GPS on the GhostLink peer streamed over GhostLink to the C5 primary instead of relying on C5 soft GPS RX which has reliability issues
+- Refactored WiFi options for better UX
+  - Removed individual select and track options
+  - Added new details view for listing APs, Stations and both combined
+- Improved Wi-Fi details view on Cardputer-sized screens with a compact layout and staged detail/action navigation so clipped details can be scrolled before action rows without cutting off the details view
+- Station scan now parses 802.11 frame control (type/subtype/DS bits) for better validation
+- Station scan now captures data frames in addition to management frames for better detection
+
+### Fixed
+- Fixed new soft GPS parser losing first bytes of sentences by implementing double-buffering to eliminate re-arm gap
+- Fixed soft GPS receive getting stuck after an RMT re-arm failure by adding retry recovery and re-arm telemetry counters
+- Fixed wardriving writing stale last-known coordinates when GPS fix flags remained set but no fresh `GPS_UPDATE` events were arriving
+- Fixed a peer-helper wardriving crash risk caused by reading the live GPS parser handle while it could be deinitialized during helper/local GPS handoff
+- Fixed a wardriving packet parsing crash risk by validating short management frames before copying the 802.11 header
+- Fixed watchdog timeout during CSV UART streaming by releasing mutex before slow writes
+- Potentially fixed watchdog timeout wardriving crash when writing to SD by making CSV buffer flush asynchronous
+- Potentially fixed wardriving crash caused by O(n) linear probing in dedupe table
+- Fixed BLE stop/exit races by stopping spam, spoofing, and scan modules before NimBLE deinit and waiting for the BLE spam task to exit cleanly
+- Fixed repeated saved-WiFi reconnect failures after BLE use by restarting the Wi-Fi driver when needed and cancelling in-progress retries when `stop` is used
+- Fixed a saved-WiFi reconnect crash where the UDP visualizer task could leak its socket, fail to rebind port `6677`, and abort when the task returned
+- Fixed a saved-WiFi reconnect crash caused by reconfiguring SNTP while the SNTP client was already running
+- Fixed Cardputer Wi-Fi scan/detail instability by removing re-entrant LVGL timer handling, increasing the LVGL tick task stack, and correcting display/SD SPI separation and guard checks during startup
+
+
 ## Revival v1.9.4
 
+### Added
+- Added `wifistatus` CLI command to show connection status and saved network info
+- Added new wardriving and GPS info display view
+- Added GhostLink split-channel wardriving helper mode (`startwd --helper`) with helper-to-primary observation streaming
+- Added optional software NMEA RX backend (`minmea_soft`) for template-specific GPS routing constraints
+- Added Factory Reset option to wipe NVS and reboot
+- Added auto upload to WiGLE - @Play2BReal
+- Added WiGLE manual upload browser in display settings with paged CSV list and per-file upload actions
+- Added WiGLE stats popup in display settings with scroll and close controls
+- Added WiGLE CLI commands: `wigle files [page]`, `wigle upload <filename>`, and `wigle stats` - @Play2BReal, @jaylikesbunda
+- Added control app updates - @tototo31
+- Added Flipper Zero Companion App documentation - @tototo31
+- Added SD JIT mounting for custom evil portal menu option
+- Added hold to invert letter case on joystick select in keyboard view
+- Added option to select custom portal for karma attack
+- Add IO expander programmable button commands - @tototo31
+- Added 'Cherry Blossom' and 'Soft Sand' themes
+
+### Changed
 - 'chipinfo' command now shows firmware version and enabled build features (Display, NFC, BadUSB, IR, GPS, etc.)
 - Use country-appropriate channel list in main deauth task
-- Fixed station deauth channel lookup
-- Fixed GPS latitude parsing for GLL sentences (was using 3-digit degree width instead of 2)
 - Improved GPS Info display with fix mode, satellites in view, and cleaner logging
 - Moved multiple attacks and scans to separate files for maintainability
 - Significantly optimised port scan memory usage
-- Fixed BLE not initializing when selecting a flipper
 - Slightly increased IR Learn task size to prevent crash
-- Added `wifistatus` CLI command to show connection status and saved network info
-- Fixed a crash when deinitializing BLE
 - Improved BLE Spam
 - Deauth: fixed 5GHz HT40 tuning, added burst loops, and removed rate limiting
-- Fixed GPS satellites logic
-- Fixed misc Wardriving issues
-- Added New Wardriving and GPS info display view
 - Reorganized settings menu into more categories
-- Added Factory Reset option to wipe NVS and reboot
-- Added auto upload to WiGLE - @Play2BReal
-- Control app updates - @tototo31
-- Added Flipper Zero Companion App documentation - @tototo31
-- Fixed 5Ghz deauthing
-- Fixed a crash when stopping deauth
 - Directly iterate to channels when deauthing multiple APs
 - Optimised wardriving dwell times, added active probing and improved validation
+- Wardriving now builds role-aware channel plans for split capture (primary 5 GHz, helper 2.4 GHz when both are available)
+- Wardriving heartbeat now reports helper merge stats (`helper=merged/received`) for link visibility
+- Reworked wardriving Wi-Fi dedupe into peek/commit flow to avoid consuming dedupe state before a successful CSV write
+- Shortened delays for misc display menu building for more responsive feel
+- Improved clock view responsiveness
+- Increased BadUSB VSense delay to improve reliability of USB enumeration
+- Improved CLI `scan` validation and status messaging for invalid durations and failed timed scans
+- Improved CLI `sd` read/write/append reliability checks to report short writes and stream errors
+- Improved task startup error handling for DIAL, Karma, Deauth, Beacon, EAPOL, DHCP Starvation, and SAE Flood
+- Improved BLE capture startup flow to fail fast when handler registration or scan start fails
+- Optimized PineAP detection memory model by lazily allocating detection tables at start and freeing them on stop
+- Reworked PineAP detection logging to use a single queued worker task instead of per-detection task creation
+- Reworked PCAP writer buffering to use a fixed static packet slot pool instead of per-packet heap allocations
+- Reduced splash screen hold time from 2000ms to 900ms
+- Refactored surface colors to be consistent across the UI
+- Changed default screen timeout to 30s
 - Miscellaneous fixes, improvements and refactors
+- Fixed feberis pro spelling
+
+### Fixed
+- Fixed station deauth channel lookup
+- Fixed potential NULL dereference in command registration when `strdup` fails under low memory
+- Fixed silent serial startup failures by validating queue and task creation in `serial_manager_init`
+- Fixed race-prone stop behavior in SAE flood by waiting for task exit before freeing crypto context
+- Fixed race-prone restart behavior in Karma and Beacon by waiting/cleaning lingering tasks on stop
+- Fixed DHCP starvation reporting success while socket/send operations were failing
+- Fixed `select` CLI parse errors that omitted the invalid token and improved index list boundary checks
+- Fixed GPS latitude parsing for GLL sentences (was using 3-digit degree width instead of 2)
+- Fixed BLE not initializing when selecting a flipper
+- Fixed crash when deinitializing BLE
+- Fixed BLE stop hangs by draining active scan callbacks before shutdown and reducing heavy callback work
+- Potentially fixed "Connect to saved WiFi" resets on repeated use
+- Fixed GPS satellites logic
+- Fixed misc wardriving issues
+- Fixed wardriving AP loss where entries seen before a valid GPS fix could be skipped later by premature dedupe mutation
+- Fixed 5GHz deauthing
+- Fixed crash when stopping deauth
+- Fixed joystick repeat only working vertically
+- Fixed evil portal JIT mounting
+- Fixed crash on the Setup Wizard screen
+- Fixed touch handler for the WiGLE help popup
+- Fixed saving of WiGLE API credentials to mirror other setting saves
+- Fixed listing large amounts of evil portals on displays
+- Fixed crash starting karma attack
+- Fixed 'stop' not stopping the karma attack
+- Fixed joystick and touch input not checking if display is dimmed
+- Fixed wardrive exiting when waking the display with a touch press
+- Fixed NFC saved tag popup having vertically aligned buttons instead of horizontal
+- Fixed Marauder v4 SD Card mounting
 
 ## Revival v1.9.3
 

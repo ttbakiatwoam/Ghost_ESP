@@ -11,6 +11,13 @@
 
 static const char *TAG = "WiFiChannels";
 
+static bool country_code_is(const wifi_country_t *country, const char *cc2) {
+    if (!country || !cc2) {
+        return false;
+    }
+    return country->cc[0] == cc2[0] && country->cc[1] == cc2[1];
+}
+
 bool wifi_channels_is_5ghz(uint8_t channel) {
     return channel > 14;
 }
@@ -70,32 +77,32 @@ uint8_t wifi_channels_build_country_list(uint8_t *channels, uint8_t max_count) {
     
     #if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
     // 5GHz band support for ESP32-C5/C6
-    if (strcmp(country.cc, "US") == 0 || strcmp(country.cc, "CA") == 0) {
+    if (country_code_is(&country, "US") || country_code_is(&country, "CA")) {
         // North America: all bands allowed
         uint8_t us_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165};
         for (int i = 0; i < sizeof(us_5ghz) && count < max_count; i++) {
             channels[count++] = us_5ghz[i];
         }
-    } else if (strcmp(country.cc, "JP") == 0) {
+    } else if (country_code_is(&country, "JP")) {
         // Japan: all bands with restrictions
         uint8_t jp_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140};
         for (int i = 0; i < sizeof(jp_5ghz) && count < max_count; i++) {
             channels[count++] = jp_5ghz[i];
         }
-    } else if (strcmp(country.cc, "CN") == 0) {
+    } else if (country_code_is(&country, "CN")) {
         // China: limited 5GHz
         uint8_t cn_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 149, 153, 157, 161, 165};
         for (int i = 0; i < sizeof(cn_5ghz) && count < max_count; i++) {
             channels[count++] = cn_5ghz[i];
         }
-    } else if (strcmp(country.cc, "EU") == 0 || strcmp(country.cc, "GB") == 0 || 
-               strcmp(country.cc, "DE") == 0 || strcmp(country.cc, "FR") == 0) {
+    } else if (country_code_is(&country, "EU") || country_code_is(&country, "GB") ||
+               country_code_is(&country, "DE") || country_code_is(&country, "FR")) {
         // Europe: UNII-1 and UNII-2
         uint8_t eu_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120, 124, 128, 132, 136, 140};
         for (int i = 0; i < sizeof(eu_5ghz) && count < max_count; i++) {
             channels[count++] = eu_5ghz[i];
         }
-    } else if (strcmp(country.cc, "AU") == 0 || strcmp(country.cc, "NZ") == 0) {
+    } else if (country_code_is(&country, "AU") || country_code_is(&country, "NZ")) {
         // Australia/New Zealand: UNII-1, UNII-2, UNII-3 (no DFS mid-band)
         uint8_t au_5ghz[] = {36, 40, 44, 48, 52, 56, 60, 64, 149, 153, 157, 161, 165};
         for (int i = 0; i < sizeof(au_5ghz) && count < max_count; i++) {
@@ -110,7 +117,7 @@ uint8_t wifi_channels_build_country_list(uint8_t *channels, uint8_t max_count) {
     }
     #endif
     
-    ESP_LOGI(TAG, "Country %s: using %d channels", country.cc, count);
+    ESP_LOGI(TAG, "Country %.2s: using %d channels", country.cc, count);
     return count;
 }
 

@@ -264,8 +264,16 @@ void beacon_spam_start(const char *ssid) {
         ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP)); // Set AP mode for 802.11 TX
         configure_hidden_ap();
         esp_wifi_start();
+        BaseType_t rc = xTaskCreate(beacon_spam_task, "beacon_task", 2048, (void *)ssid, 5, &beacon_task_handle);
+        if (rc != pdPASS) {
+            glog("Failed to start beacon task (%ld)\n", (long)rc);
+            status_display_show_status("Beacon Start Failed");
+            beacon_task_handle = NULL;
+            esp_wifi_stop();
+            ap_manager_init();
+            return;
+        }
         beacon_task_running = true;
-        xTaskCreate(beacon_spam_task, "beacon_task", 2048, (void *)ssid, 5, &beacon_task_handle);
         rgb_manager_set_color(&rgb_manager, 0, 255, 0, 0, false);
     } else {
         glog("Beacon transmission already running.\n");
@@ -289,15 +297,25 @@ void beacon_spam_stop(void) {
             wait_count++;
         }
 
+        if (beacon_task_handle != NULL) {
+            vTaskDelete(beacon_task_handle);
+            beacon_task_handle = NULL;
+        }
+
         // Turn off RGB indicator
         rgb_manager_set_color(&rgb_manager, -1, 0, 0, 0, false);
 
         // Stop WiFi completely
-        esp_wifi_stop();
-        vTaskDelay(pdMS_TO_TICKS(500)); // Give some time for WiFi to stop
+        esp_err_t stop_err = esp_wifi_stop();
+        if (stop_err != ESP_OK) {
+            glog("Beacon stop warning: failed to stop WiFi (%s)\n", esp_err_to_name(stop_err));
+        }
 
         // Reset WiFi mode
-        esp_wifi_set_mode(WIFI_MODE_AP);
+        esp_err_t mode_err = esp_wifi_set_mode(WIFI_MODE_AP);
+        if (mode_err != ESP_OK) {
+            glog("Beacon stop warning: failed to reset WiFi mode (%s)\n", esp_err_to_name(mode_err));
+        }
 
         // Now restart services
         ap_manager_init();
@@ -321,9 +339,17 @@ void beacon_spam_start_list(void) {
     configure_hidden_ap();
     esp_wifi_start();
     
-    beacon_task_running = true;
     // Launch the beacon list task
-    xTaskCreate(beacon_spam_list_task, "beacon_list", 2048, NULL, 5, &beacon_task_handle);
+    BaseType_t rc = xTaskCreate(beacon_spam_list_task, "beacon_list", 2048, NULL, 5, &beacon_task_handle);
+    if (rc != pdPASS) {
+        glog("Failed to start beacon list task (%ld)\n", (long)rc);
+        status_display_show_status("Beacon Start Failed");
+        beacon_task_handle = NULL;
+        esp_wifi_stop();
+        ap_manager_init();
+        return;
+    }
+    beacon_task_running = true;
     rgb_manager_set_color(&rgb_manager, 0, 255, 0, 0, false);
 }
 

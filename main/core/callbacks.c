@@ -1,6 +1,5 @@
 #include "core/callbacks.h"
 #include "esp_wifi.h"
-#include "esp_random.h"
 #include "managers/gps_manager.h"
 #include "managers/rgb_manager.h"
 #include "managers/views/terminal_screen.h"
@@ -10,15 +9,20 @@
 #include "vendor/GPS/gps_logger.h"
 #include "vendor/pcap.h"
 #include "core/glog.h"
+#include "core/esp_comm_manager.h"
 #include "scans/wifi/wifi_channels.h"
 #include <ctype.h>
 #include <esp_log.h>
+#include <esp_heap_caps.h>
 #include <string.h>
+#include <stdlib.h>
+#include <math.h>
 #include <time.h>
 #include <sys/time.h>
 #include "esp_rom_sys.h"  // Contains esp_rom_printf
 #include <esp_timer.h>  // For esp_timer_get_time
 #include "freertos/task.h"
+#include "freertos/queue.h"
 
 // prototypes for static inline helpers
 static inline bool is_packet_valid(const wifi_promiscuous_pkt_t *pkt, wifi_promiscuous_pkt_type_t type);
@@ -46,6 +50,21 @@ static inline bool is_on_target_channel(const wifi_promiscuous_pkt_t *pkt, uint8
 #define MAX_WIFI_CHANNEL 13
 #endif
 #define CHANNEL_HOP_INTERVAL_MS 100
+#define WARDRIVE_STREAM_VERSION 2
+#define WARDRIVE_STREAM_VERSION_LEGACY 1
+#define WARDRIVE_STREAM_FLAG_GPS_PRESENT 0x01
+#define WARDRIVE_STREAM_FLAG_GPS_FIX 0x02
+#define WARDRIVE_STREAM_FLAG_GPS_DATE_VALID 0x04
+#define WARDRIVE_STREAM_FLAG_GPS_TIME_VALID 0x08
+#define GPS_STREAM_VERSION 1
+#define GPS_STREAM_FLAG_PRESENT 0x01
+#define GPS_STREAM_FLAG_FIX 0x02
+#define GPS_STREAM_FLAG_DATE_VALID 0x04
+#define GPS_STREAM_FLAG_TIME_VALID 0x08
+#define WARDRIVE_HELPER_DEDUPE_SIZE 128
+#define WARDRIVE_HELPER_REFRESH_MS 25000
+#define PEER_GPS_STREAM_INTERVAL_MS 1000
+#define PEER_GPS_INIT_RETRY_MS 5000
 #define RECENT_SSID_COUNT 5
 #define LOG_DELAY_MS 5000
 #define PROBE_DEDUPE_TIMEOUT_MS 1000
@@ -56,7 +75,7 @@ static const uint8_t pineapple_ouis[][3] = {
     {0x00, 0x13, 0x37},
 };
 static const size_t pineapple_oui_count = sizeof(pineapple_ouis) / sizeof(pineapple_ouis[0]);
-static pineap_network_t pineap_networks[MAX_PINEAP_NETWORKS];
+static pineap_network_t *pineap_networks = NULL;
 static int pineap_network_count = 0;
 static bool pineap_detection_active = false;
 static uint8_t current_channel = 1;
@@ -71,6 +90,20 @@ static uint32_t wardrive_ble_advs_seen = 0;
 static uint32_t wardrive_log_attempts = 0;
 static uint32_t wardrive_log_ok = 0;
 static uint32_t wardrive_gps_rejected = 0;
+static uint32_t wardrive_helper_rx_observations = 0;
+static uint32_t wardrive_helper_merged_ok = 0;
+static uint32_t wardrive_helper_tx_new = 0;
+static uint32_t wardrive_helper_tx_ssid_promo = 0;
+static uint32_t wardrive_helper_tx_rssi = 0;
+static uint32_t wardrive_helper_tx_refresh = 0;
+static uint32_t wardrive_helper_tx_suppressed = 0;
+static uint32_t wardrive_helper_stream_send_ok = 0;
+static uint32_t wardrive_helper_stream_send_fail = 0;
+static uint32_t peer_gps_stream_tx_ok = 0;
+static uint32_t peer_gps_stream_tx_fail = 0;
+static uint32_t peer_gps_stream_rx_packets = 0;
+static uint32_t peer_gps_stream_rx_fix_packets = 0;
+static TaskHandle_t peer_gps_stream_task_handle = NULL;
 
 #ifndef CONFIG_IDF_TARGET_ESP32S2
 #define BLE_WD_SEEN_SIZE 64
@@ -106,29 +139,591 @@ static uint8_t wardrive_channels[WIFI_CHANNELS_MAX];
 static uint8_t wardrive_channel_count = 0;
 static uint8_t wardrive_channel_idx = 0;
 
-static void shuffle_channels(uint8_t *arr, uint8_t n) {
-    for (uint8_t i = n - 1; i > 0; i--) {
-        uint8_t j = esp_random() % (i + 1);
-        uint8_t tmp = arr[i];
-        arr[i] = arr[j];
-        arr[j] = tmp;
+typedef enum {
+    WARDRIVE_ROLE_PRIMARY = 0,
+    WARDRIVE_ROLE_HELPER = 1,
+} wardrive_role_t;
+
+typedef enum {
+    WD_AUTH_OPEN = 0,
+    WD_AUTH_WEP = 1,
+    WD_AUTH_WPA = 2,
+    WD_AUTH_WPA2 = 3,
+    WD_AUTH_WPA3 = 4,
+    WD_AUTH_OWE = 5,
+} wd_auth_t;
+
+typedef struct {
+    uint32_t hash;
+    int8_t best_rssi;
+    uint32_t last_sent_ms;
+    bool ssid_empty;
+    bool used;
+} wardrive_helper_dedupe_t;
+
+static wardrive_role_t wardrive_role = WARDRIVE_ROLE_PRIMARY;
+static bool wardrive_peer_assist_active = false;
+static wardrive_helper_dedupe_t wardrive_helper_dedupe[WARDRIVE_HELPER_DEDUPE_SIZE];
+static uint8_t wardrive_helper_dedupe_idx = 0;
+static uint8_t wardrive_forced_helper_channels[WIFI_CHANNELS_MAX] = {0};
+static uint8_t wardrive_forced_helper_channel_count = 0;
+
+static void wardrive_stream_rx_cb(uint8_t channel, const uint8_t *data, size_t length, void *user_data);
+static void gps_stream_rx_cb(uint8_t channel, const uint8_t *data, size_t length, void *user_data);
+static uint8_t wardrive_select_auth_code(const char *encryption_type);
+static const char *wardrive_auth_code_to_string(uint8_t auth_code);
+static uint32_t wardrive_hash_bssid(const uint8_t *bssid);
+static bool wardrive_helper_should_send(const uint8_t *bssid, int8_t rssi, const char *ssid);
+static bool wardrive_send_helper_observation(const uint8_t *bssid,
+                                             uint8_t channel,
+                                             int8_t rssi,
+                                             uint8_t auth_code,
+                                             const char *ssid);
+static inline void wardrive_put_i32le(uint8_t *dst, int32_t value);
+static inline void wardrive_put_i16le(uint8_t *dst, int16_t value);
+static inline int32_t wardrive_get_i32le(const uint8_t *src);
+static inline int16_t wardrive_get_i16le(const uint8_t *src);
+static bool wardrive_is_valid_date(const gps_date_t *date);
+static bool wardrive_is_valid_time(const gps_time_t *tim);
+static inline uint32_t now_ms_u32(void);
+static bool wardrive_send_peer_gps_stream(void);
+static void peer_gps_stream_task(void *arg);
+static uint32_t wardrive_get_hop_interval_ms(void);
+static void wardrive_apply_hop_interval(void);
+static uint8_t wardrive_build_full_channel_list(uint8_t *full_channels);
+
+static uint8_t wardrive_select_auth_code(const char *encryption_type) {
+    if (!encryption_type) {
+        return WD_AUTH_OPEN;
+    }
+    if (strcmp(encryption_type, "WEP") == 0) {
+        return WD_AUTH_WEP;
+    }
+    if (strcmp(encryption_type, "WPA") == 0) {
+        return WD_AUTH_WPA;
+    }
+    if (strcmp(encryption_type, "WPA2") == 0) {
+        return WD_AUTH_WPA2;
+    }
+    if (strcmp(encryption_type, "WPA3") == 0) {
+        return WD_AUTH_WPA3;
+    }
+    if (strcmp(encryption_type, "OWE") == 0) {
+        return WD_AUTH_OWE;
+    }
+    return WD_AUTH_OPEN;
+}
+
+static const char *wardrive_auth_code_to_string(uint8_t auth_code) {
+    switch (auth_code) {
+        case WD_AUTH_WEP:
+            return "WEP";
+        case WD_AUTH_WPA:
+            return "WPA";
+        case WD_AUTH_WPA2:
+            return "WPA2";
+        case WD_AUTH_WPA3:
+            return "WPA3";
+        case WD_AUTH_OWE:
+            return "OWE";
+        case WD_AUTH_OPEN:
+        default:
+            return "OPEN";
     }
 }
 
-static void wardrive_build_channel_list(void) {
-    wardrive_channel_count = wifi_channels_build_country_list(wardrive_channels, WIFI_CHANNELS_MAX);
-    
-    if (wardrive_channel_count == 0) {
+static uint32_t wardrive_hash_bssid(const uint8_t *bssid) {
+    uint32_t hash = 2166136261u;
+    for (int i = 0; i < 6; i++) {
+        hash ^= bssid[i];
+        hash *= 16777619u;
+    }
+    return hash ? hash : 1u;
+}
+
+static inline void wardrive_put_i32le(uint8_t *dst, int32_t value) {
+    dst[0] = (uint8_t)(value & 0xFF);
+    dst[1] = (uint8_t)((value >> 8) & 0xFF);
+    dst[2] = (uint8_t)((value >> 16) & 0xFF);
+    dst[3] = (uint8_t)((value >> 24) & 0xFF);
+}
+
+static inline void wardrive_put_i16le(uint8_t *dst, int16_t value) {
+    dst[0] = (uint8_t)(value & 0xFF);
+    dst[1] = (uint8_t)((value >> 8) & 0xFF);
+}
+
+static inline int32_t wardrive_get_i32le(const uint8_t *src) {
+    return (int32_t)((uint32_t)src[0] |
+                     ((uint32_t)src[1] << 8) |
+                     ((uint32_t)src[2] << 16) |
+                     ((uint32_t)src[3] << 24));
+}
+
+static inline int16_t wardrive_get_i16le(const uint8_t *src) {
+    return (int16_t)((uint16_t)src[0] | ((uint16_t)src[1] << 8));
+}
+
+static bool wardrive_is_valid_date(const gps_date_t *date) {
+    if (!date) {
+        return false;
+    }
+    if (date->year > 99 || date->month < 1 || date->month > 12 || date->day < 1 || date->day > 31) {
+        return false;
+    }
+    return true;
+}
+
+static bool wardrive_is_valid_time(const gps_time_t *tim) {
+    if (!tim) {
+        return false;
+    }
+    return tim->hour <= 23 && tim->minute <= 59 && tim->second <= 59;
+}
+
+static bool wardrive_helper_should_send(const uint8_t *bssid, int8_t rssi, const char *ssid) {
+    uint32_t hash = wardrive_hash_bssid(bssid);
+    uint32_t now_ms = now_ms_u32();
+    bool ssid_empty = (!ssid || ssid[0] == '\0');
+
+    for (int i = 0; i < WARDRIVE_HELPER_DEDUPE_SIZE; i++) {
+        wardrive_helper_dedupe_t *entry = &wardrive_helper_dedupe[i];
+        if (entry->used && entry->hash == hash) {
+            if (entry->ssid_empty && !ssid_empty) {
+                entry->ssid_empty = false;
+                if (rssi > entry->best_rssi) {
+                    entry->best_rssi = rssi;
+                }
+                entry->last_sent_ms = now_ms;
+                wardrive_helper_tx_ssid_promo++;
+                return true;
+            }
+            if (rssi > entry->best_rssi + 3) {
+                entry->best_rssi = rssi;
+                if (!ssid_empty) {
+                    entry->ssid_empty = false;
+                }
+                entry->last_sent_ms = now_ms;
+                wardrive_helper_tx_rssi++;
+                return true;
+            }
+            if ((uint32_t)(now_ms - entry->last_sent_ms) >= WARDRIVE_HELPER_REFRESH_MS) {
+                if (rssi > entry->best_rssi) {
+                    entry->best_rssi = rssi;
+                }
+                if (!ssid_empty) {
+                    entry->ssid_empty = false;
+                }
+                entry->last_sent_ms = now_ms;
+                wardrive_helper_tx_refresh++;
+                return true;
+            }
+            wardrive_helper_tx_suppressed++;
+            return false;
+        }
+    }
+
+    wardrive_helper_dedupe_t *slot = &wardrive_helper_dedupe[wardrive_helper_dedupe_idx];
+    slot->used = true;
+    slot->hash = hash;
+    slot->best_rssi = rssi;
+    slot->last_sent_ms = now_ms;
+    slot->ssid_empty = ssid_empty;
+    wardrive_helper_dedupe_idx = (uint8_t)((wardrive_helper_dedupe_idx + 1) % WARDRIVE_HELPER_DEDUPE_SIZE);
+    wardrive_helper_tx_new++;
+    return true;
+}
+
+static bool wardrive_send_helper_observation(const uint8_t *bssid,
+                                             uint8_t channel,
+                                             int8_t rssi,
+                                             uint8_t auth_code,
+                                             const char *ssid) {
+    if (!esp_comm_manager_is_connected()) {
+        return false;
+    }
+
+    uint8_t ssid_len = 0;
+    if (ssid) {
+        size_t raw_len = strlen(ssid);
+        /* Keep helper stream payload <= 59 bytes so it fits one comm packet. */
+        if (raw_len > 23) {
+            raw_len = 23;
+        }
+        ssid_len = (uint8_t)raw_len;
+    }
+
+    uint8_t payload[1 + 1 + 1 + 1 + 6 + 1 + 32 + 1 + 4 + 4 + 2 + 1 + 1 + 1 + 1 + 2 + 7] = {0};
+    size_t pos = 0;
+    payload[pos++] = WARDRIVE_STREAM_VERSION;
+    payload[pos++] = channel;
+    payload[pos++] = (uint8_t)rssi;
+    payload[pos++] = auth_code;
+    memcpy(payload + pos, bssid, 6);
+    pos += 6;
+    payload[pos++] = ssid_len;
+    if (ssid_len > 0) {
+        memcpy(payload + pos, ssid, ssid_len);
+        pos += ssid_len;
+    }
+
+    uint8_t gps_flags = 0;
+    int32_t lat_e7 = 0;
+    int32_t lon_e7 = 0;
+    int16_t alt_dm = 0;
+    uint8_t sats_in_use = 0;
+    uint8_t sats_in_view = 0;
+    uint8_t fix = (uint8_t)GPS_FIX_INVALID;
+    uint8_t fix_mode = (uint8_t)GPS_MODE_INVALID;
+    uint16_t hdop_x10 = 0;
+    uint8_t gps_day = 0;
+    uint8_t gps_month = 0;
+    uint16_t gps_year = 0;
+    uint8_t gps_hour = 0;
+    uint8_t gps_minute = 0;
+    uint8_t gps_second = 0;
+
+    gps_t local_gps = {0};
+    if (gps_manager_has_recent_update() && gps_manager_get_local_gps_snapshot(&local_gps)) {
+        gps_flags |= WARDRIVE_STREAM_FLAG_GPS_PRESENT;
+        sats_in_use = local_gps.sats_in_use;
+        sats_in_view = local_gps.sats_in_view;
+        fix = (uint8_t)local_gps.fix;
+        fix_mode = (uint8_t)local_gps.fix_mode;
+
+        if (local_gps.dop_h >= 0.0f && local_gps.dop_h <= 6553.5f) {
+            hdop_x10 = (uint16_t)(local_gps.dop_h * 10.0f);
+        }
+
+        if (wardrive_is_valid_date(&local_gps.date)) {
+            gps_flags |= WARDRIVE_STREAM_FLAG_GPS_DATE_VALID;
+        }
+        if (wardrive_is_valid_time(&local_gps.tim)) {
+            gps_flags |= WARDRIVE_STREAM_FLAG_GPS_TIME_VALID;
+        }
+        gps_day = local_gps.date.day;
+        gps_month = local_gps.date.month;
+        gps_year = local_gps.date.year;
+        gps_hour = local_gps.tim.hour;
+        gps_minute = local_gps.tim.minute;
+        gps_second = local_gps.tim.second;
+
+        if (local_gps.valid && local_gps.fix >= GPS_FIX_GPS && local_gps.fix_mode >= GPS_MODE_2D &&
+            local_gps.latitude >= -90.0f && local_gps.latitude <= 90.0f &&
+            local_gps.longitude >= -180.0f && local_gps.longitude <= 180.0f) {
+            gps_flags |= WARDRIVE_STREAM_FLAG_GPS_FIX;
+            lat_e7 = (int32_t)(local_gps.latitude * 10000000.0f);
+            lon_e7 = (int32_t)(local_gps.longitude * 10000000.0f);
+            float alt = local_gps.altitude * 10.0f;
+            if (alt > 32767.0f) {
+                alt = 32767.0f;
+            }
+            if (alt < -32768.0f) {
+                alt = -32768.0f;
+            }
+            alt_dm = (int16_t)alt;
+        }
+    }
+
+    payload[pos++] = gps_flags;
+    if (gps_flags & WARDRIVE_STREAM_FLAG_GPS_PRESENT) {
+        wardrive_put_i32le(payload + pos, lat_e7);
+        pos += 4;
+        wardrive_put_i32le(payload + pos, lon_e7);
+        pos += 4;
+        wardrive_put_i16le(payload + pos, alt_dm);
+        pos += 2;
+        payload[pos++] = sats_in_use;
+        payload[pos++] = sats_in_view;
+        payload[pos++] = fix;
+        payload[pos++] = fix_mode;
+        payload[pos++] = (uint8_t)(hdop_x10 & 0xFF);
+        payload[pos++] = (uint8_t)((hdop_x10 >> 8) & 0xFF);
+        payload[pos++] = gps_day;
+        payload[pos++] = gps_month;
+        wardrive_put_i16le(payload + pos, (int16_t)gps_year);
+        pos += 2;
+        payload[pos++] = gps_hour;
+        payload[pos++] = gps_minute;
+        payload[pos++] = gps_second;
+    }
+
+    return esp_comm_manager_send_stream(COMM_STREAM_CHANNEL_WARDRIVE, payload, pos);
+}
+
+static bool wardrive_send_peer_gps_stream(void) {
+    if (!esp_comm_manager_is_connected()) {
+        return false;
+    }
+
+    gps_t gps_local = {0};
+    if (!gps_manager_get_local_gps_snapshot(&gps_local)) {
+        return false;
+    }
+
+    uint8_t payload[1 + 1 + 4 + 4 + 2 + 1 + 1 + 1 + 1 + 2 + 2 + 2 + 7] = {0};
+    size_t pos = 0;
+    payload[pos++] = GPS_STREAM_VERSION;
+
+    uint8_t flags = GPS_STREAM_FLAG_PRESENT;
+    bool has_fix = gps_local.valid &&
+                   gps_local.fix >= GPS_FIX_GPS &&
+                   gps_local.fix_mode >= GPS_MODE_2D &&
+                   gps_local.latitude >= -90.0f && gps_local.latitude <= 90.0f &&
+                   gps_local.longitude >= -180.0f && gps_local.longitude <= 180.0f;
+    if (has_fix) {
+        flags |= GPS_STREAM_FLAG_FIX;
+    }
+    if (wardrive_is_valid_date(&gps_local.date)) {
+        flags |= GPS_STREAM_FLAG_DATE_VALID;
+    }
+    if (wardrive_is_valid_time(&gps_local.tim)) {
+        flags |= GPS_STREAM_FLAG_TIME_VALID;
+    }
+    payload[pos++] = flags;
+
+    int32_t lat_e7 = has_fix ? (int32_t)(gps_local.latitude * 10000000.0f) : 0;
+    int32_t lon_e7 = has_fix ? (int32_t)(gps_local.longitude * 10000000.0f) : 0;
+    float alt_dm_f = gps_local.altitude * 10.0f;
+    if (alt_dm_f > 32767.0f) {
+        alt_dm_f = 32767.0f;
+    }
+    if (alt_dm_f < -32768.0f) {
+        alt_dm_f = -32768.0f;
+    }
+    int16_t alt_dm = (int16_t)alt_dm_f;
+
+    uint16_t hdop_x10 = 0;
+    if (isfinite(gps_local.dop_h) && gps_local.dop_h >= 0.0f && gps_local.dop_h <= 6553.5f) {
+        hdop_x10 = (uint16_t)(gps_local.dop_h * 10.0f);
+    }
+
+    float speed_x100_f = gps_local.speed * 100.0f;
+    if (!isfinite(speed_x100_f)) {
+        speed_x100_f = 0.0f;
+    }
+    if (speed_x100_f > 32767.0f) {
+        speed_x100_f = 32767.0f;
+    }
+    if (speed_x100_f < -32768.0f) {
+        speed_x100_f = -32768.0f;
+    }
+    int16_t speed_x100 = (int16_t)speed_x100_f;
+
+    float course_x100_f = gps_local.cog * 100.0f;
+    if (!isfinite(course_x100_f)) {
+        course_x100_f = 0.0f;
+    }
+    if (course_x100_f > 32767.0f) {
+        course_x100_f = 32767.0f;
+    }
+    if (course_x100_f < -32768.0f) {
+        course_x100_f = -32768.0f;
+    }
+    int16_t course_x100 = (int16_t)course_x100_f;
+
+    wardrive_put_i32le(payload + pos, lat_e7);
+    pos += 4;
+    wardrive_put_i32le(payload + pos, lon_e7);
+    pos += 4;
+    wardrive_put_i16le(payload + pos, alt_dm);
+    pos += 2;
+    payload[pos++] = gps_local.sats_in_use;
+    payload[pos++] = gps_local.sats_in_view;
+    payload[pos++] = (uint8_t)gps_local.fix;
+    payload[pos++] = (uint8_t)gps_local.fix_mode;
+    wardrive_put_i16le(payload + pos, (int16_t)hdop_x10);
+    pos += 2;
+    wardrive_put_i16le(payload + pos, speed_x100);
+    pos += 2;
+    wardrive_put_i16le(payload + pos, course_x100);
+    pos += 2;
+    payload[pos++] = gps_local.date.day;
+    payload[pos++] = gps_local.date.month;
+    wardrive_put_i16le(payload + pos, (int16_t)gps_local.date.year);
+    pos += 2;
+    payload[pos++] = gps_local.tim.hour;
+    payload[pos++] = gps_local.tim.minute;
+    payload[pos++] = gps_local.tim.second;
+
+    return esp_comm_manager_send_stream(COMM_STREAM_CHANNEL_GPS, payload, pos);
+}
+
+static void peer_gps_stream_task(void *arg) {
+    (void)arg;
+    int64_t last_init_try_ms = 0;
+    gps_t gps_local = {0};
+
+    while (1) {
+        if (esp_comm_manager_is_connected()) {
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+            if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething2") == 0 &&
+                !g_gpsManager.isinitilized) {
+                int64_t now_ms = esp_timer_get_time() / 1000;
+                if ((now_ms - last_init_try_ms) >= PEER_GPS_INIT_RETRY_MS) {
+                    gps_manager_init(&g_gpsManager);
+                    last_init_try_ms = now_ms;
+                }
+            }
+#endif
+
+            if (gps_manager_get_local_gps_snapshot(&gps_local)) {
+                if (wardrive_send_peer_gps_stream()) {
+                    peer_gps_stream_tx_ok++;
+                } else {
+                    peer_gps_stream_tx_fail++;
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(PEER_GPS_STREAM_INTERVAL_MS));
+    }
+}
+
+static uint32_t wardrive_get_hop_interval_ms(void) {
+    uint32_t interval_ms = CHANNEL_HOP_INTERVAL_MS;
+    if (interval_ms < 40) {
+        interval_ms = 40;
+    }
+    if (interval_ms > 1000) {
+        interval_ms = 1000;
+    }
+    return interval_ms;
+}
+
+static void wardrive_apply_hop_interval(void) {
+    if (!wardriving_hopping_active || wardrive_hop_timer == NULL) {
+        return;
+    }
+
+    uint32_t interval_ms = wardrive_get_hop_interval_ms();
+    (void)esp_timer_stop(wardrive_hop_timer);
+    esp_err_t err = esp_timer_start_periodic(wardrive_hop_timer, (uint64_t)interval_ms * 1000ULL);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Wardrive: failed to apply hop interval (%s)", esp_err_to_name(err));
+        return;
+    }
+
+    ESP_LOGI(TAG, "Wardrive: hop interval now %lu ms", (unsigned long)interval_ms);
+}
+
+static uint8_t wardrive_build_full_channel_list(uint8_t *full_channels) {
+    if (!full_channels) {
+        return 0;
+    }
+
+    uint8_t full_count = wifi_channels_build_country_list(full_channels, WIFI_CHANNELS_MAX);
+    if (full_count == 0) {
         uint8_t fallback[] = {1,2,3,4,5,6,7,8,9,10,11,12,13,
             36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165};
         uint8_t count = sizeof(fallback);
         if (count > WIFI_CHANNELS_MAX) count = WIFI_CHANNELS_MAX;
-        memcpy(wardrive_channels, fallback, count);
-        wardrive_channel_count = count;
+        memcpy(full_channels, fallback, count);
+        full_count = count;
     }
-    
-    shuffle_channels(wardrive_channels, wardrive_channel_count);
-    ESP_LOGI(TAG, "Wardrive: %d channels (shuffled)", wardrive_channel_count);
+
+    return full_count;
+}
+
+static void wardrive_build_channel_list(void) {
+    uint8_t full_channels[WIFI_CHANNELS_MAX] = {0};
+    uint8_t channels_24[WIFI_CHANNELS_MAX] = {0};
+    uint8_t channels_5[WIFI_CHANNELS_MAX] = {0};
+    uint8_t channels_24_count = 0;
+    uint8_t channels_5_count = 0;
+    uint8_t full_count = wardrive_build_full_channel_list(full_channels);
+
+    for (uint8_t i = 0; i < full_count; i++) {
+        if (full_channels[i] <= 14) {
+            channels_24[channels_24_count++] = full_channels[i];
+        } else {
+            channels_5[channels_5_count++] = full_channels[i];
+        }
+    }
+
+    wardrive_channel_count = 0;
+    if (wardrive_role == WARDRIVE_ROLE_PRIMARY && !wardrive_peer_assist_active) {
+        memcpy(wardrive_channels, full_channels, full_count);
+        wardrive_channel_count = full_count;
+    } else if (wardrive_role == WARDRIVE_ROLE_PRIMARY) {
+        if (channels_5_count > 0 && channels_24_count > 0) {
+            memcpy(wardrive_channels, channels_5, channels_5_count);
+            wardrive_channel_count = channels_5_count;
+        } else {
+            for (uint8_t i = 0; i < full_count; i += 2) {
+                wardrive_channels[wardrive_channel_count++] = full_channels[i];
+            }
+        }
+    } else {
+        if (wardrive_forced_helper_channel_count > 0) {
+            memcpy(wardrive_channels, wardrive_forced_helper_channels, wardrive_forced_helper_channel_count);
+            wardrive_channel_count = wardrive_forced_helper_channel_count;
+        } else if (channels_24_count > 0) {
+            memcpy(wardrive_channels, channels_24, channels_24_count);
+            wardrive_channel_count = channels_24_count;
+        } else {
+            for (uint8_t i = 1; i < full_count; i += 2) {
+                wardrive_channels[wardrive_channel_count++] = full_channels[i];
+            }
+        }
+    }
+
+    if (wardrive_channel_count == 0) {
+        memcpy(wardrive_channels, full_channels, full_count);
+        wardrive_channel_count = full_count;
+    }
+
+    ESP_LOGI(TAG,
+             "Wardrive: role=%s channels=%d/%d assist=%s bands(2.4=%d,5=%d) forced_helper=%d",
+             wardrive_role == WARDRIVE_ROLE_PRIMARY ? "primary" : "helper",
+             wardrive_channel_count,
+             full_count,
+             wardrive_peer_assist_active ? "on" : "off",
+             channels_24_count,
+             channels_5_count,
+             wardrive_forced_helper_channel_count);
+}
+
+static uint8_t wardrive_parse_channel_csv(const char *csv, uint8_t *out, uint8_t out_max) {
+    if (!csv || !out || out_max == 0) {
+        return 0;
+    }
+
+    char buf[192];
+    strncpy(buf, csv, sizeof(buf) - 1);
+    buf[sizeof(buf) - 1] = '\0';
+
+    uint8_t count = 0;
+    char *tok = strtok(buf, ",");
+    while (tok && count < out_max) {
+        while (*tok && isspace((unsigned char)*tok)) tok++;
+        char *end = tok + strlen(tok);
+        while (end > tok && isspace((unsigned char)end[-1])) {
+            end--;
+        }
+        *end = '\0';
+
+        if (*tok != '\0') {
+            char *num_end = NULL;
+            long ch = strtol(tok, &num_end, 10);
+            if (num_end != tok && *num_end == '\0' && ch >= 1 && ch <= MAX_WIFI_CHANNEL) {
+                bool exists = false;
+                for (uint8_t i = 0; i < count; i++) {
+                    if (out[i] == (uint8_t)ch) {
+                        exists = true;
+                        break;
+                    }
+                }
+                if (!exists) {
+                    out[count++] = (uint8_t)ch;
+                }
+            }
+        }
+
+        tok = strtok(NULL, ",");
+    }
+
+    return count;
 }
 
 static uint32_t hash_ssid(const char *ssid);
@@ -286,13 +881,86 @@ static bool beacon_should_emit_limited(const uint8_t *bssid, bool ssid_has_text)
 // queued writer to avoid heavy work in promiscuous callback
 typedef struct {
     uint16_t length;
-    uint8_t *buffer;
+    uint8_t data[768];
+    bool in_use;
+} pcap_pool_slot_t;
+
+typedef struct {
+    uint8_t slot_idx;
     pcap_capture_type_t cap_type;
 } pcap_q_item_t;
 
 #define EAPOL_Q_LEN 64
+#if defined(CONFIG_IDF_TARGET_ESP32S2)
+#define PCAP_POOL_SLOTS_DEFAULT 10
+#define PCAP_POOL_SLOTS_MIN 4
+#else
+#define PCAP_POOL_SLOTS_DEFAULT 16
+#define PCAP_POOL_SLOTS_MIN 8
+#endif
 static QueueHandle_t s_pcap_q = NULL;
 static TaskHandle_t s_pcap_writer_task = NULL;
+static pcap_pool_slot_t *s_pcap_pool = NULL;
+static size_t s_pcap_pool_slots = 0;
+static portMUX_TYPE s_pcap_pool_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static bool pcap_pool_init(void) {
+    if (s_pcap_pool != NULL && s_pcap_pool_slots > 0) {
+        return true;
+    }
+
+    size_t slots = PCAP_POOL_SLOTS_DEFAULT;
+    while (slots >= PCAP_POOL_SLOTS_MIN) {
+        pcap_pool_slot_t *pool = (pcap_pool_slot_t *)heap_caps_calloc(slots, sizeof(pcap_pool_slot_t), MALLOC_CAP_8BIT);
+        if (pool != NULL) {
+            s_pcap_pool = pool;
+            s_pcap_pool_slots = slots;
+            ESP_LOGI(TAG, "PCAP pool allocated: %lu slots (%lu bytes)",
+                     (unsigned long)s_pcap_pool_slots,
+                     (unsigned long)(s_pcap_pool_slots * sizeof(pcap_pool_slot_t)));
+            return true;
+        }
+        if (slots == PCAP_POOL_SLOTS_MIN) {
+            break;
+        }
+        slots = (slots > 2) ? (slots - 2) : PCAP_POOL_SLOTS_MIN;
+        if (slots < PCAP_POOL_SLOTS_MIN) {
+            slots = PCAP_POOL_SLOTS_MIN;
+        }
+    }
+
+    ESP_LOGE(TAG, "PCAP pool allocation failed");
+    return false;
+}
+
+static int pcap_pool_acquire_slot(void) {
+    if (s_pcap_pool == NULL || s_pcap_pool_slots == 0) {
+        return -1;
+    }
+
+    int slot = -1;
+    taskENTER_CRITICAL(&s_pcap_pool_lock);
+    for (size_t i = 0; i < s_pcap_pool_slots; i++) {
+        if (!s_pcap_pool[i].in_use) {
+            s_pcap_pool[i].in_use = true;
+            slot = (int)i;
+            break;
+        }
+    }
+    taskEXIT_CRITICAL(&s_pcap_pool_lock);
+    return slot;
+}
+
+static void pcap_pool_release_slot(uint8_t slot_idx) {
+    if (s_pcap_pool == NULL || s_pcap_pool_slots == 0 || slot_idx >= s_pcap_pool_slots) {
+        return;
+    }
+
+    taskENTER_CRITICAL(&s_pcap_pool_lock);
+    s_pcap_pool[slot_idx].in_use = false;
+    s_pcap_pool[slot_idx].length = 0;
+    taskEXIT_CRITICAL(&s_pcap_pool_lock);
+}
 
 static void pcap_writer_task(void *arg) {
     (void)arg;
@@ -300,9 +968,12 @@ static void pcap_writer_task(void *arg) {
     uint32_t processed = 0;
     for (;;) {
         if (xQueueReceive(s_pcap_q, &item, pdMS_TO_TICKS(500)) == pdTRUE) {
-            if (item.buffer && item.length > 0) {
-                pcap_write_packet_to_buffer(item.buffer, item.length, item.cap_type);
-                free(item.buffer);
+            if (s_pcap_pool != NULL && item.slot_idx < s_pcap_pool_slots) {
+                pcap_pool_slot_t *slot = &s_pcap_pool[item.slot_idx];
+                if (slot->length > 0) {
+                    pcap_write_packet_to_buffer(slot->data, slot->length, item.cap_type);
+                }
+                pcap_pool_release_slot(item.slot_idx);
             }
             processed++;
             if ((processed & 0xFF) == 0) { // log occasionally to avoid spam
@@ -320,11 +991,17 @@ static void pcap_writer_task(void *arg) {
 }
 
 static inline void ensure_pcap_queue_started(void) {
-    if (s_pcap_q == NULL) {
-        s_pcap_q = xQueueCreate(EAPOL_Q_LEN, sizeof(pcap_q_item_t));
-        if (s_pcap_q != NULL && s_pcap_writer_task == NULL) {
-            xTaskCreate(pcap_writer_task, "pcap_wr", 3072, NULL, 5, &s_pcap_writer_task);
-        }
+    if (s_pcap_q != NULL) {
+        return;
+    }
+
+    if (!pcap_pool_init()) {
+        return;
+    }
+
+    s_pcap_q = xQueueCreate(EAPOL_Q_LEN, sizeof(pcap_q_item_t));
+    if (s_pcap_q != NULL && s_pcap_writer_task == NULL) {
+        xTaskCreate(pcap_writer_task, "pcap_wr", 3072, NULL, 5, &s_pcap_writer_task);
     }
 }
 
@@ -332,14 +1009,30 @@ static inline void enqueue_pcap_write_typed(const uint8_t *payload, uint16_t len
     if (!payload || len == 0) return;
     ensure_pcap_queue_started();
     if (!s_pcap_q) return;
+
+    if (s_pcap_pool == NULL || s_pcap_pool_slots == 0) {
+        return;
+    }
+
+    if (len > sizeof(s_pcap_pool[0].data)) {
+        return;
+    }
+
+    int slot = pcap_pool_acquire_slot();
+    if (slot < 0) {
+        return;
+    }
+
+    pcap_pool_slot_t *pool_slot = &s_pcap_pool[slot];
+    pool_slot->length = len;
+    memcpy(pool_slot->data, payload, len);
+
     pcap_q_item_t item = {0};
-    item.length = len;
-    item.buffer = (uint8_t *)malloc(len);
     item.cap_type = cap_type;
-    if (!item.buffer) return;
-    memcpy(item.buffer, payload, len);
+    item.slot_idx = (uint8_t)slot;
+
     if (xQueueSend(s_pcap_q, &item, 0) != pdTRUE) {
-        free(item.buffer);
+        pcap_pool_release_slot((uint8_t)slot);
     }
 }
 
@@ -354,13 +1047,23 @@ void cleanup_pcap_queue(void) {
         s_pcap_writer_task = NULL;
     }
     if (s_pcap_q != NULL) {
-        // drain any remaining items and free their buffers
+        // drain any remaining items and release pool slots
         pcap_q_item_t item;
         while (xQueueReceive(s_pcap_q, &item, 0) == pdTRUE) {
-            if (item.buffer) free(item.buffer);
+            pcap_pool_release_slot(item.slot_idx);
         }
         vQueueDelete(s_pcap_q);
         s_pcap_q = NULL;
+    }
+
+    if (s_pcap_pool != NULL) {
+        pcap_pool_slot_t *pool_to_free = NULL;
+        taskENTER_CRITICAL(&s_pcap_pool_lock);
+        pool_to_free = s_pcap_pool;
+        s_pcap_pool = NULL;
+        s_pcap_pool_slots = 0;
+        taskEXIT_CRITICAL(&s_pcap_pool_lock);
+        heap_caps_free(pool_to_free);
     }
 }
 
@@ -442,10 +1145,53 @@ typedef struct {
     time_t last_update_time;
 } blacklisted_ap_t;
 
-static blacklisted_ap_t blacklist[MAX_PINEAP_NETWORKS];
+static blacklisted_ap_t *blacklist = NULL;
 static int blacklist_count = 0;
 
+typedef struct {
+    uint8_t network_index;
+    uint32_t due_ms;
+} pineap_log_event_t;
+
+#define PINEAP_LOG_QUEUE_LEN 8
+static QueueHandle_t s_pineap_log_queue = NULL;
+static TaskHandle_t s_pineap_log_task = NULL;
+
+static inline uint32_t now_ms_u32(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static bool allocate_pineap_tables(void) {
+    if (pineap_networks != NULL && blacklist != NULL) {
+        return true;
+    }
+
+    pineap_network_t *new_networks = calloc(MAX_PINEAP_NETWORKS, sizeof(*new_networks));
+    blacklisted_ap_t *new_blacklist = calloc(MAX_PINEAP_NETWORKS, sizeof(*new_blacklist));
+    if (new_networks == NULL || new_blacklist == NULL) {
+        free(new_networks);
+        free(new_blacklist);
+        return false;
+    }
+
+    pineap_networks = new_networks;
+    blacklist = new_blacklist;
+    return true;
+}
+
+static void free_pineap_tables(void) {
+    free(pineap_networks);
+    pineap_networks = NULL;
+    free(blacklist);
+    blacklist = NULL;
+    pineap_network_count = 0;
+    blacklist_count = 0;
+}
+
 static bool is_blacklisted(const uint8_t *bssid) {
+    if (blacklist == NULL) {
+        return false;
+    }
     for (int i = 0; i < blacklist_count; i++) {
         if (memcmp(blacklist[i].bssid, bssid, 6) == 0) {
             return true;
@@ -455,6 +1201,9 @@ static bool is_blacklisted(const uint8_t *bssid) {
 }
 
 static bool should_update_blacklisted(const uint8_t *bssid) {
+    if (blacklist == NULL) {
+        return false;
+    }
     for (int i = 0; i < blacklist_count; i++) {
         if (memcmp(blacklist[i].bssid, bssid, 6) == 0) {
             time_t current_time = time(NULL);
@@ -470,6 +1219,9 @@ static bool should_update_blacklisted(const uint8_t *bssid) {
 }
 
 static void add_to_blacklist(const uint8_t *bssid) {
+    if (blacklist == NULL) {
+        return;
+    }
     time_t current_time = time(NULL);
 
     // First check if BSSID exists
@@ -519,6 +1271,10 @@ static void stop_channel_hopping(void) {
 }
 
 static pineap_network_t *find_or_create_network(const uint8_t *bssid) {
+    if (pineap_networks == NULL) {
+        return NULL;
+    }
+
     for (int i = 0; i < pineap_network_count; i++) {
         if (compare_bssid(pineap_networks[i].bssid, bssid)) {
             return &pineap_networks[i];
@@ -533,6 +1289,8 @@ static pineap_network_t *find_or_create_network(const uint8_t *bssid) {
         network->has_pineapple_oui = is_pineapple_oui(bssid);
         network->oui_logged = false;
         network->first_seen = time(NULL);
+        network->log_due_ms = 0;
+        network->log_pending = false;
         return network;
     }
 
@@ -590,6 +1348,20 @@ static void wardrive_hop_timer_callback(void *arg) {
     if (!wardriving_hopping_active)
         return;
 
+    if (wardrive_role == WARDRIVE_ROLE_PRIMARY && wardrive_peer_assist_active && !esp_comm_manager_is_connected()) {
+        wardrive_peer_assist_active = false;
+        gps_manager_set_peer_gps_preferred(false);
+        gps_manager_clear_peer_fix();
+        wardrive_build_channel_list();
+        wardrive_channel_idx = 0;
+        if (wardrive_channel_count > 0) {
+            wardrive_channel = wardrive_channels[0];
+            (void)esp_wifi_set_channel(wardrive_channel, WIFI_SECOND_CHAN_NONE);
+        }
+        glog("Wardrive: peer helper link lost, continuing local scan only\n");
+        wardrive_apply_hop_interval();
+    }
+
     wardrive_channel_idx = (wardrive_channel_idx + 1) % wardrive_channel_count;
     wardrive_channel = wardrive_channels[wardrive_channel_idx];
     esp_wifi_set_channel(wardrive_channel, WIFI_SECOND_CHAN_NONE);
@@ -599,7 +1371,7 @@ static void wardrive_hop_timer_callback(void *arg) {
     
     static int hop_count = 0;
     hop_count++;
-    if (hop_count % 50 == 0) {
+    if (hop_count % 200 == 0) {
         ESP_LOGI(TAG, "Wardrive hopped to channel %d (hop #%d)", wardrive_channel, hop_count);
     }
 }
@@ -624,12 +1396,17 @@ static esp_err_t start_wardrive_channel_hopping(void) {
     esp_err_t err = esp_wifi_set_channel(wardrive_channel, WIFI_SECOND_CHAN_NONE);
     ESP_LOGI(TAG, "Wardrive starting on channel %d (set_channel: %s)", wardrive_channel, esp_err_to_name(err));
     
-    err = esp_timer_start_periodic(wardrive_hop_timer, CHANNEL_HOP_INTERVAL_MS * 1000);
+    uint32_t interval_ms = wardrive_get_hop_interval_ms();
+    err = esp_timer_start_periodic(wardrive_hop_timer, (uint64_t)interval_ms * 1000ULL);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "Failed to start wardrive hop timer: %s", esp_err_to_name(err));
         return err;
     }
-    ESP_LOGI(TAG, "Wardrive channel hopping started (%d channels, %dms interval)", wardrive_channel_count, CHANNEL_HOP_INTERVAL_MS);
+    ESP_LOGI(TAG,
+             "Wardrive channel hopping started (%d channels, %lums interval, role=%s)",
+             wardrive_channel_count,
+             (unsigned long)interval_ms,
+             wardrive_role == WARDRIVE_ROLE_PRIMARY ? "primary" : "helper");
     return ESP_OK;
 }
 
@@ -651,25 +1428,42 @@ static void wardrive_heartbeat_cb(void *arg) {
         return;
     }
 
+    gps_t gps_snapshot = {0};
+    bool using_peer_gps = false;
+    bool have_active_gps = gps_manager_get_active_gps_snapshot(&gps_snapshot, &using_peer_gps);
+    bool peer_preferred = gps_manager_is_peer_gps_preferred();
     gps_t *gps_local = NULL;
     const char *fix_status = "No GPS";
+    char fix_status_buf[24] = {0};
     uint8_t sats = 0;
 
-    if (nmea_hdl != NULL) {
-        gps_local = &((esp_gps_t *)nmea_hdl)->parent;
+    if (have_active_gps) {
+        gps_local = &gps_snapshot;
+    } else if (!peer_preferred) {
+        static gps_t local_snapshot = {0};
+        if (gps_manager_get_local_gps_snapshot(&local_snapshot)) {
+            gps_local = &local_snapshot;
+        }
     }
 
     if (gps_local != NULL) {
         sats = gps_local->sats_in_use;
         if (!gps_local->valid || gps_local->fix < GPS_FIX_GPS || gps_local->fix_mode < GPS_MODE_2D) {
-            fix_status = "No Fix";
+            fix_status = using_peer_gps ? "Peer No Fix" : "No Fix";
         } else if (gps_local->fix_mode == GPS_MODE_2D) {
-            fix_status = "2D";
+            fix_status = using_peer_gps ? "Peer 2D" : "2D";
         } else if (gps_local->fix_mode == GPS_MODE_3D) {
-            fix_status = "3D";
+            fix_status = using_peer_gps ? "Peer 3D" : "3D";
         } else {
-            fix_status = "Fix";
+            fix_status = using_peer_gps ? "Peer Fix" : "Fix";
         }
+
+        if (!wardrive_is_valid_date(&gps_local->date)) {
+            snprintf(fix_status_buf, sizeof(fix_status_buf), "%s/NoDate", fix_status);
+            fix_status = fix_status_buf;
+        }
+    } else if (peer_preferred) {
+        fix_status = "Peer Stale";
     }
 
     uint32_t up_s = 0;
@@ -681,18 +1475,57 @@ static void wardrive_heartbeat_cb(void *arg) {
     uint32_t up_rem_s = up_s % 60;
 
     size_t pending = csv_get_pending_bytes();
+    size_t heap_free = heap_caps_get_free_size(MALLOC_CAP_8BIT);
+    size_t heap_largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
 
-    glog("Wardrive: ap=%lu logged=%lu/%lu gpsrej=%lu ch=%u up=%lum%02lus gps=%s/%u pending=%uB\n",
-         (unsigned long)wardrive_wifi_frames_seen,
-         (unsigned long)wardrive_log_ok,
-         (unsigned long)wardrive_log_attempts,
-         (unsigned long)wardrive_gps_rejected,
-         (unsigned)wardrive_channel,
-         (unsigned long)up_m,
-         (unsigned long)up_rem_s,
-         fix_status,
-         (unsigned)sats,
-         (unsigned)pending);
+    if (wardrive_role == WARDRIVE_ROLE_HELPER) {
+        glog("Wardrive: ap=%lu logged=%lu/%lu gpsrej=%lu helper=%lu/%lu tx(n/p/r/t/s)=%lu/%lu/%lu/%lu/%lu send(ok/fail)=%lu/%lu peergps(rx/fix tx_ok/fail)=%lu/%lu %lu/%lu ch=%u up=%lum%02lus gps=%s/%u pending=%uB heap=%u/%uB\n",
+             (unsigned long)wardrive_wifi_frames_seen,
+             (unsigned long)wardrive_log_ok,
+             (unsigned long)wardrive_log_attempts,
+             (unsigned long)wardrive_gps_rejected,
+             (unsigned long)wardrive_helper_merged_ok,
+             (unsigned long)wardrive_helper_rx_observations,
+             (unsigned long)wardrive_helper_tx_new,
+             (unsigned long)wardrive_helper_tx_ssid_promo,
+             (unsigned long)wardrive_helper_tx_rssi,
+             (unsigned long)wardrive_helper_tx_refresh,
+             (unsigned long)wardrive_helper_tx_suppressed,
+             (unsigned long)wardrive_helper_stream_send_ok,
+             (unsigned long)wardrive_helper_stream_send_fail,
+             (unsigned long)peer_gps_stream_rx_packets,
+             (unsigned long)peer_gps_stream_rx_fix_packets,
+             (unsigned long)peer_gps_stream_tx_ok,
+             (unsigned long)peer_gps_stream_tx_fail,
+             (unsigned)wardrive_channel,
+             (unsigned long)up_m,
+             (unsigned long)up_rem_s,
+             fix_status,
+             (unsigned)sats,
+             (unsigned)pending,
+             (unsigned)heap_free,
+             (unsigned)heap_largest);
+    } else {
+        glog("Wardrive: ap=%lu logged=%lu/%lu gpsrej=%lu helper=%lu/%lu peergps(rx/fix tx_ok/fail)=%lu/%lu %lu/%lu ch=%u up=%lum%02lus gps=%s/%u pending=%uB heap=%u/%uB\n",
+             (unsigned long)wardrive_wifi_frames_seen,
+             (unsigned long)wardrive_log_ok,
+             (unsigned long)wardrive_log_attempts,
+             (unsigned long)wardrive_gps_rejected,
+             (unsigned long)wardrive_helper_merged_ok,
+             (unsigned long)wardrive_helper_rx_observations,
+             (unsigned long)peer_gps_stream_rx_packets,
+             (unsigned long)peer_gps_stream_rx_fix_packets,
+             (unsigned long)peer_gps_stream_tx_ok,
+             (unsigned long)peer_gps_stream_tx_fail,
+             (unsigned)wardrive_channel,
+             (unsigned long)up_m,
+             (unsigned long)up_rem_s,
+             fix_status,
+             (unsigned)sats,
+             (unsigned)pending,
+             (unsigned)heap_free,
+             (unsigned)heap_largest);
+    }
 }
 
 static void start_wardrive_heartbeat(void) {
@@ -702,11 +1535,47 @@ static void start_wardrive_heartbeat(void) {
     wardrive_log_attempts = 0;
     wardrive_log_ok = 0;
     wardrive_gps_rejected = 0;
+    wardrive_helper_rx_observations = 0;
+    wardrive_helper_merged_ok = 0;
+    wardrive_helper_tx_new = 0;
+    wardrive_helper_tx_ssid_promo = 0;
+    wardrive_helper_tx_rssi = 0;
+    wardrive_helper_tx_refresh = 0;
+    wardrive_helper_tx_suppressed = 0;
+    wardrive_helper_stream_send_ok = 0;
+    wardrive_helper_stream_send_fail = 0;
+    peer_gps_stream_tx_ok = 0;
+    peer_gps_stream_tx_fail = 0;
+    peer_gps_stream_rx_packets = 0;
+    peer_gps_stream_rx_fix_packets = 0;
+    memset(wardrive_helper_dedupe, 0, sizeof(wardrive_helper_dedupe));
+    wardrive_helper_dedupe_idx = 0;
 #ifndef CONFIG_IDF_TARGET_ESP32S2
     memset(ble_wd_seen_hashes, 0, sizeof(ble_wd_seen_hashes));
     ble_wd_seen_idx = 0;
     ble_wd_unique_count = 0;
 #endif
+
+    if (!wardrive_heartbeat_timer) {
+        const esp_timer_create_args_t timer_args = {
+            .callback = &wardrive_heartbeat_cb,
+            .arg = NULL,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "wardrive_hb"
+        };
+        esp_err_t err = esp_timer_create(&timer_args, &wardrive_heartbeat_timer);
+        if (err != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to create wardrive heartbeat timer: %s", esp_err_to_name(err));
+            return;
+        }
+    }
+
+    (void)esp_timer_stop(wardrive_heartbeat_timer);
+    esp_err_t start_err = esp_timer_start_periodic(wardrive_heartbeat_timer,
+                                                   (uint64_t)LOG_DELAY_MS * 1000ULL);
+    if (start_err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to start wardrive heartbeat timer: %s", esp_err_to_name(start_err));
+    }
 }
 
 static void stop_wardrive_heartbeat(void) {
@@ -717,10 +1586,94 @@ static void stop_wardrive_heartbeat(void) {
     }
 }
 
+static void pineap_log_worker_task(void *arg) {
+    (void)arg;
+    pineap_log_event_t ev;
+
+    for (;;) {
+        if (xQueueReceive(s_pineap_log_queue, &ev, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        uint32_t now = now_ms_u32();
+        if (ev.due_ms > now) {
+            vTaskDelay(pdMS_TO_TICKS(ev.due_ms - now));
+        }
+
+        if (!pineap_detection_active || pineap_networks == NULL) {
+            continue;
+        }
+
+        if (ev.network_index >= (uint8_t)pineap_network_count) {
+            continue;
+        }
+
+        pineap_network_t *network = &pineap_networks[ev.network_index];
+        if (!network->log_pending || network->log_due_ms != ev.due_ms) {
+            continue;
+        }
+
+        char mac_str[18];
+        format_mac_address(network->bssid, mac_str, sizeof(mac_str), false);
+
+        char ssids_str[256] = {0};
+        int valid_ssid_count = build_recent_ssids_string(network, ssids_str, sizeof(ssids_str));
+
+        if (valid_ssid_count >= MIN_SSIDS_FOR_DETECTION) {
+            pulse_once(&rgb_manager, 255, 0, 255);
+
+            for (int i = 0; i < pineap_network_count; i++) {
+                if (i != (network - pineap_networks) &&
+                    strcasecmp(network->recent_ssids[0], pineap_networks[i].recent_ssids[0]) == 0) {
+                    char other_mac_str[18];
+                    format_mac_address(pineap_networks[i].bssid, other_mac_str, sizeof(other_mac_str), false);
+                    glog("Evil Twin Detected:\nSame SSID '%.100s'\nfrom BSSID %s and\n%s\n",
+                         network->recent_ssids[0], mac_str, other_mac_str);
+                }
+            }
+
+            log_pineap_details(network, "Pineapple detected!", ssids_str, valid_ssid_count);
+        }
+
+        network->log_pending = false;
+        network->log_due_ms = 0;
+    }
+}
+
+static void start_pineap_log_worker(void) {
+    if (s_pineap_log_queue == NULL) {
+        s_pineap_log_queue = xQueueCreate(PINEAP_LOG_QUEUE_LEN, sizeof(pineap_log_event_t));
+    }
+    if (s_pineap_log_queue != NULL && s_pineap_log_task == NULL) {
+        if (xTaskCreate(pineap_log_worker_task, "pineap_logw", 1792, NULL, 1, &s_pineap_log_task) != pdPASS) {
+            s_pineap_log_task = NULL;
+        }
+    }
+}
+
+static void stop_pineap_log_worker(void) {
+    if (s_pineap_log_task != NULL) {
+        vTaskDelete(s_pineap_log_task);
+        s_pineap_log_task = NULL;
+    }
+    if (s_pineap_log_queue != NULL) {
+        vQueueDelete(s_pineap_log_queue);
+        s_pineap_log_queue = NULL;
+    }
+}
+
 void start_pineap_detection(void) {
+    if (!allocate_pineap_tables()) {
+        glog("PineAP: failed to allocate detection tables\n");
+        return;
+    }
+
     pineap_detection_active = true;
     pineap_network_count = 0;
-    memset(pineap_networks, 0, sizeof(pineap_networks));
+    blacklist_count = 0;
+    memset(pineap_networks, 0, MAX_PINEAP_NETWORKS * sizeof(*pineap_networks));
+    memset(blacklist, 0, MAX_PINEAP_NETWORKS * sizeof(*blacklist));
+    start_pineap_log_worker();
     wardrive_build_channel_list();
     wardrive_channel_idx = 0;
     current_channel = wardrive_channels[0];
@@ -730,9 +1683,345 @@ void start_pineap_detection(void) {
 void stop_pineap_detection(void) {
     pineap_detection_active = false;
     stop_channel_hopping();
+    stop_pineap_log_worker();
+    free_pineap_tables();
+}
+
+static void wardrive_stream_rx_cb(uint8_t channel, const uint8_t *data, size_t length, void *user_data) {
+    (void)channel;
+    (void)user_data;
+
+    if (!data || length < (1 + 1 + 1 + 1 + 6 + 1)) {
+        return;
+    }
+    if (!wardriving_hopping_active || wardrive_role != WARDRIVE_ROLE_PRIMARY) {
+        return;
+    }
+
+    size_t pos = 0;
+    uint8_t version = data[pos++];
+    if (version != WARDRIVE_STREAM_VERSION && version != WARDRIVE_STREAM_VERSION_LEGACY) {
+        return;
+    }
+
+    uint8_t channel_num = data[pos++];
+    int8_t rssi = (int8_t)data[pos++];
+    uint8_t auth_code = data[pos++];
+    const uint8_t *bssid = data + pos;
+    pos += 6;
+    uint8_t ssid_len = data[pos++];
+    if (ssid_len > 32 || (pos + ssid_len) > length) {
+        return;
+    }
+
+    char ssid[33] = {0};
+    if (ssid_len > 0) {
+        memcpy(ssid, data + pos, ssid_len);
+        ssid[ssid_len] = '\0';
+    }
+    pos += ssid_len;
+
+    gps_peer_fix_t peer_fix = {0};
+    bool peer_fix_present = false;
+    bool peer_fix_has_coords = false;
+    if (version >= WARDRIVE_STREAM_VERSION) {
+        if (pos >= length) {
+            return;
+        }
+
+        uint8_t gps_flags = data[pos++];
+        if (gps_flags & WARDRIVE_STREAM_FLAG_GPS_PRESENT) {
+            if ((length - pos) < (4 + 4 + 2 + 1 + 1 + 1 + 1 + 2)) {
+                return;
+            }
+
+            int32_t lat_e7 = wardrive_get_i32le(data + pos);
+            pos += 4;
+            int32_t lon_e7 = wardrive_get_i32le(data + pos);
+            pos += 4;
+            int16_t alt_dm = wardrive_get_i16le(data + pos);
+            pos += 2;
+            uint8_t sats_in_use = data[pos++];
+            uint8_t sats_in_view = data[pos++];
+            uint8_t fix = data[pos++];
+            uint8_t fix_mode = data[pos++];
+            uint16_t hdop_x10 = (uint16_t)data[pos] | ((uint16_t)data[pos + 1] << 8);
+            pos += 2;
+            uint8_t day = 0;
+            uint8_t month = 0;
+            uint16_t year = 0;
+            uint8_t hour = 0;
+            uint8_t minute = 0;
+            uint8_t second = 0;
+            if ((length - pos) >= 7) {
+                day = data[pos++];
+                month = data[pos++];
+                year = (uint16_t)data[pos] | ((uint16_t)data[pos + 1] << 8);
+                pos += 2;
+                hour = data[pos++];
+                minute = data[pos++];
+                second = data[pos++];
+            }
+
+            peer_fix_present = true;
+            peer_fix.valid = (gps_flags & WARDRIVE_STREAM_FLAG_GPS_FIX) != 0;
+            peer_fix.fix = (gps_fix_t)fix;
+            peer_fix.fix_mode = (gps_fix_mode_t)fix_mode;
+            peer_fix.date_valid = (gps_flags & WARDRIVE_STREAM_FLAG_GPS_DATE_VALID) != 0;
+            peer_fix.time_valid = (gps_flags & WARDRIVE_STREAM_FLAG_GPS_TIME_VALID) != 0;
+            peer_fix.date.day = day;
+            peer_fix.date.month = month;
+            peer_fix.date.year = year;
+            peer_fix.tim.hour = hour;
+            peer_fix.tim.minute = minute;
+            peer_fix.tim.second = second;
+            peer_fix.tim.thousand = 0;
+            peer_fix.sats_in_use = sats_in_use;
+            peer_fix.sats_in_view = sats_in_view;
+            peer_fix.latitude = (float)lat_e7 / 10000000.0f;
+            peer_fix.longitude = (float)lon_e7 / 10000000.0f;
+            peer_fix.altitude = (float)alt_dm / 10.0f;
+            peer_fix.speed = 0.0f;
+            peer_fix.course = 0.0f;
+            peer_fix.hdop = (float)hdop_x10 / 10.0f;
+
+            peer_fix_has_coords =
+                peer_fix.valid &&
+                peer_fix.latitude >= -90.0f && peer_fix.latitude <= 90.0f &&
+                peer_fix.longitude >= -180.0f && peer_fix.longitude <= 180.0f;
+
+            gps_manager_update_peer_fix(&peer_fix);
+        }
+    }
+
+    wardrive_helper_rx_observations++;
+
+    wardriving_data_t wardriving_data = {0};
+    wardriving_data.ble_data.is_ble_device = false;
+    if (ssid_len == 0) {
+        strncpy(wardriving_data.ssid, "<hidden>", sizeof(wardriving_data.ssid) - 1);
+    } else {
+        strncpy(wardriving_data.ssid, ssid, sizeof(wardriving_data.ssid) - 1);
+    }
+    snprintf(wardriving_data.bssid,
+             sizeof(wardriving_data.bssid),
+             "%02x:%02x:%02x:%02x:%02x:%02x",
+             bssid[0],
+             bssid[1],
+             bssid[2],
+             bssid[3],
+             bssid[4],
+             bssid[5]);
+    wardriving_data.rssi = rssi;
+    wardriving_data.channel = channel_num;
+    strncpy(wardriving_data.encryption_type,
+            wardrive_auth_code_to_string(auth_code),
+            sizeof(wardriving_data.encryption_type) - 1);
+    if (peer_fix_present && peer_fix_has_coords) {
+        wardriving_data.latitude = peer_fix.latitude;
+        wardriving_data.longitude = peer_fix.longitude;
+        wardriving_data.altitude = peer_fix.altitude;
+        wardriving_data.accuracy = peer_fix.hdop * 5.0f;
+    }
+
+    wardrive_log_attempts++;
+    esp_err_t err = gps_manager_log_wardriving_data(&wardriving_data);
+    if (err == ESP_ERR_INVALID_STATE) {
+        wardrive_gps_rejected++;
+    } else if (err == ESP_OK) {
+        wardrive_log_ok++;
+        wardrive_helper_merged_ok++;
+    }
+}
+
+static void gps_stream_rx_cb(uint8_t channel, const uint8_t *data, size_t length, void *user_data) {
+    (void)channel;
+    (void)user_data;
+
+    if (!data || length < (1 + 1 + 4 + 4 + 2 + 1 + 1 + 1 + 1 + 2 + 2 + 2)) {
+        return;
+    }
+
+    size_t pos = 0;
+    uint8_t version = data[pos++];
+    if (version != GPS_STREAM_VERSION) {
+        return;
+    }
+
+    uint8_t flags = data[pos++];
+    int32_t lat_e7 = wardrive_get_i32le(data + pos);
+    pos += 4;
+    int32_t lon_e7 = wardrive_get_i32le(data + pos);
+    pos += 4;
+    int16_t alt_dm = wardrive_get_i16le(data + pos);
+    pos += 2;
+    uint8_t sats_in_use = data[pos++];
+    uint8_t sats_in_view = data[pos++];
+    uint8_t fix = data[pos++];
+    uint8_t fix_mode = data[pos++];
+    int16_t hdop_x10 = wardrive_get_i16le(data + pos);
+    pos += 2;
+    int16_t speed_x100 = wardrive_get_i16le(data + pos);
+    pos += 2;
+    int16_t course_x100 = wardrive_get_i16le(data + pos);
+    pos += 2;
+    uint8_t day = 0;
+    uint8_t month = 0;
+    uint16_t year = 0;
+    uint8_t hour = 0;
+    uint8_t minute = 0;
+    uint8_t second = 0;
+    if ((length - pos) >= 7) {
+        day = data[pos++];
+        month = data[pos++];
+        year = (uint16_t)data[pos] | ((uint16_t)data[pos + 1] << 8);
+        pos += 2;
+        hour = data[pos++];
+        minute = data[pos++];
+        second = data[pos++];
+    }
+
+    gps_peer_fix_t peer_fix = {0};
+    peer_fix.valid = (flags & GPS_STREAM_FLAG_FIX) != 0;
+    peer_fix.fix = (gps_fix_t)fix;
+    peer_fix.fix_mode = (gps_fix_mode_t)fix_mode;
+    peer_fix.date_valid = (flags & GPS_STREAM_FLAG_DATE_VALID) != 0;
+    peer_fix.time_valid = (flags & GPS_STREAM_FLAG_TIME_VALID) != 0;
+    peer_fix.date.day = day;
+    peer_fix.date.month = month;
+    peer_fix.date.year = year;
+    peer_fix.tim.hour = hour;
+    peer_fix.tim.minute = minute;
+    peer_fix.tim.second = second;
+    peer_fix.tim.thousand = 0;
+    peer_fix.sats_in_use = sats_in_use;
+    peer_fix.sats_in_view = sats_in_view;
+    peer_fix.latitude = (float)lat_e7 / 10000000.0f;
+    peer_fix.longitude = (float)lon_e7 / 10000000.0f;
+    peer_fix.altitude = (float)alt_dm / 10.0f;
+    peer_fix.hdop = (float)hdop_x10 / 10.0f;
+    peer_fix.speed = (float)speed_x100 / 100.0f;
+    peer_fix.course = (float)course_x100 / 100.0f;
+
+    gps_manager_update_peer_fix(&peer_fix);
+    peer_gps_stream_rx_packets++;
+    if (peer_fix.valid) {
+        peer_gps_stream_rx_fix_packets++;
+    }
+}
+
+void wardriving_register_stream_handler(void) {
+    bool ok = esp_comm_manager_register_stream_handler(COMM_STREAM_CHANNEL_WARDRIVE,
+                                                       wardrive_stream_rx_cb,
+                                                       NULL);
+    bool gps_ok = esp_comm_manager_register_stream_handler(COMM_STREAM_CHANNEL_GPS,
+                                                           gps_stream_rx_cb,
+                                                           NULL);
+    ESP_LOGI(TAG, "Wardrive stream handler: %s", ok ? "OK" : "FAIL");
+    ESP_LOGI(TAG, "Peer GPS stream handler: %s", gps_ok ? "OK" : "FAIL");
+
+    if (peer_gps_stream_task_handle == NULL) {
+        BaseType_t rc = xTaskCreate(peer_gps_stream_task,
+                                    "peer_gps_stream",
+                                    3072,
+                                    NULL,
+                                    3,
+                                    &peer_gps_stream_task_handle);
+        if (rc != pdPASS) {
+            peer_gps_stream_task_handle = NULL;
+            ESP_LOGW(TAG, "Peer GPS stream task create failed");
+        }
+    }
+}
+
+bool wardriving_get_helper_channel_plan_csv(char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+
+    uint8_t full_channels[WIFI_CHANNELS_MAX] = {0};
+    uint8_t channels_24[WIFI_CHANNELS_MAX] = {0};
+    uint8_t full_count = wardrive_build_full_channel_list(full_channels);
+    uint8_t channels_24_count = 0;
+
+    for (uint8_t i = 0; i < full_count; i++) {
+        if (full_channels[i] <= 14 && channels_24_count < WIFI_CHANNELS_MAX) {
+            channels_24[channels_24_count++] = full_channels[i];
+        }
+    }
+
+    uint8_t plan[WIFI_CHANNELS_MAX] = {0};
+    uint8_t plan_count = 0;
+    if (channels_24_count > 0) {
+        memcpy(plan, channels_24, channels_24_count);
+        plan_count = channels_24_count;
+    } else {
+        for (uint8_t i = 1; i < full_count && plan_count < WIFI_CHANNELS_MAX; i += 2) {
+            plan[plan_count++] = full_channels[i];
+        }
+    }
+
+    if (plan_count == 0) {
+        out[0] = '\0';
+        return false;
+    }
+
+    size_t pos = 0;
+    for (uint8_t i = 0; i < plan_count; i++) {
+        int wrote = snprintf(out + pos, out_len - pos, (i == 0) ? "%u" : ",%u", (unsigned)plan[i]);
+        if (wrote <= 0 || (size_t)wrote >= (out_len - pos)) {
+            out[0] = '\0';
+            return false;
+        }
+        pos += (size_t)wrote;
+    }
+
+    return true;
+}
+
+bool wardriving_set_helper_channels_from_csv(const char *csv) {
+    if (!csv || csv[0] == '\0') {
+        wardrive_forced_helper_channel_count = 0;
+        return true;
+    }
+
+    uint8_t parsed[WIFI_CHANNELS_MAX] = {0};
+    uint8_t count = wardrive_parse_channel_csv(csv, parsed, WIFI_CHANNELS_MAX);
+    if (count == 0) {
+        wardrive_forced_helper_channel_count = 0;
+        return false;
+    }
+
+    memcpy(wardrive_forced_helper_channels, parsed, count);
+    wardrive_forced_helper_channel_count = count;
+
+    if (wardrive_role == WARDRIVE_ROLE_HELPER) {
+        wardrive_build_channel_list();
+        wardrive_channel_idx = 0;
+        if (wardrive_channel_count > 0) {
+            wardrive_channel = wardrive_channels[0];
+            (void)esp_wifi_set_channel(wardrive_channel, WIFI_SECOND_CHAN_NONE);
+        }
+        wardrive_apply_hop_interval();
+    }
+
+    return true;
 }
 
 void start_wardriving(void) {
+    wardrive_role = WARDRIVE_ROLE_PRIMARY;
+    wardrive_forced_helper_channel_count = 0;
+    gps_manager_set_peer_gps_preferred(false);
+    gps_manager_clear_peer_fix();
+    start_wardrive_channel_hopping();
+    start_wardrive_heartbeat();
+}
+
+void start_wardriving_helper(void) {
+    wardrive_role = WARDRIVE_ROLE_HELPER;
+    wardrive_peer_assist_active = false;
+    gps_manager_set_peer_gps_preferred(false);
+    gps_manager_clear_peer_fix();
     start_wardrive_channel_hopping();
     start_wardrive_heartbeat();
 }
@@ -740,6 +2029,33 @@ void start_wardriving(void) {
 void stop_wardriving(void) {
     stop_wardrive_heartbeat();
     stop_wardrive_channel_hopping();
+    wardrive_role = WARDRIVE_ROLE_PRIMARY;
+    wardrive_peer_assist_active = false;
+    wardrive_forced_helper_channel_count = 0;
+    gps_manager_set_peer_gps_preferred(false);
+    gps_manager_clear_peer_fix();
+}
+
+void wardriving_set_peer_assist(bool enabled) {
+    bool changed = (wardrive_peer_assist_active != enabled);
+    wardrive_peer_assist_active = enabled;
+    gps_manager_set_peer_gps_preferred(enabled);
+    if (!enabled) {
+        gps_manager_clear_peer_fix();
+    }
+    if (changed && wardrive_role == WARDRIVE_ROLE_PRIMARY) {
+        wardrive_build_channel_list();
+        wardrive_channel_idx = 0;
+        if (wardrive_channel_count > 0) {
+            wardrive_channel = wardrive_channels[0];
+            (void)esp_wifi_set_channel(wardrive_channel, WIFI_SECOND_CHAN_NONE);
+        }
+        wardrive_apply_hop_interval();
+    }
+}
+
+bool wardriving_is_helper_mode(void) {
+    return wardrive_role == WARDRIVE_ROLE_HELPER;
 }
 
 uint32_t wardriving_get_ap_count(void) {
@@ -750,73 +2066,6 @@ uint32_t wardriving_get_ap_count(void) {
     static const char flash_fmt[] STORE_STR_ATTR = fmt; \
     esp_rom_printf(flash_fmt, ##__VA_ARGS__); \
 } while(0)
-
-void log_pineap_detection(void *arg) {
-    pineap_log_data_t *log_data = (pineap_log_data_t *)arg;
-    pineap_network_t *network = log_data->network;
-
-    vTaskDelay(pdMS_TO_TICKS(5000));
-
-    char mac_str[18];
-    format_mac_address(log_data->bssid, mac_str, sizeof(mac_str), false);
-
-    char ssids_str[256] = {0};
-    int valid_ssid_count =
-        build_recent_ssids_string(network, ssids_str, sizeof(ssids_str));
-
-    // Only log if we have valid SSIDs
-    if (valid_ssid_count >= MIN_SSIDS_FOR_DETECTION) {
-        // Pulse RGB purple (red + blue) to indicate Pineapple detection
-        pulse_once(&rgb_manager, 255, 0, 255);
-
-        // Evil Twin Detection: Check for same SSID from different BSSIDs
-        for (int i = 0; i < pineap_network_count; i++) {
-            if (i != (network - pineap_networks) && // Skip self
-                strcasecmp(network->recent_ssids[0], pineap_networks[i].recent_ssids[0]) == 0) {
-                // format the other network's BSSID into a string before logging
-                char other_mac_str[18];
-                format_mac_address(pineap_networks[i].bssid, other_mac_str, sizeof(other_mac_str), false);
-
-                glog("Evil Twin Detected:\nSame SSID '%.100s'\nfrom BSSID %s and\n%s\n",
-                     network->recent_ssids[0], mac_str, other_mac_str);
-            }
-        }
-
-        log_pineap_details(network, "Pineapple detected!", ssids_str, valid_ssid_count);
-    }
-
-    free(log_data);
-    network->log_task_handle = NULL; // Clear handle before deletion
-    vTaskDelete(NULL);
-}
-
-static void start_log_task(pineap_network_t *network, const char *new_ssid, int8_t channel,
-                           int8_t rssi) {
-    // Check if a task is already running
-    if (network->log_task_handle != NULL) {
-        TaskHandle_t existing_handle = network->log_task_handle;
-        network->log_task_handle = NULL; // Clear it first to avoid race conditions
-        vTaskDelete(existing_handle);    // Clean up existing task
-    }
-
-    pineap_log_data_t *log_data = malloc(sizeof(pineap_log_data_t));
-    if (!log_data)
-        return;
-
-    // Copy network data
-    memcpy(log_data->bssid, network->bssid, 6);
-    memcpy(log_data->recent_ssids, network->recent_ssids, sizeof(network->recent_ssids));
-    log_data->ssid_count = network->ssid_count;
-    log_data->channel = channel;
-    log_data->rssi = rssi;
-    log_data->network = network;
-    BaseType_t result = xTaskCreate(log_pineap_detection, "pineap_log", 1024, log_data, 1,
-                                    &network->log_task_handle);
-    if (result != pdPASS) {
-        free(log_data);
-        network->log_task_handle = NULL;
-    }
-}
 
 // Helper function to check if SSID is valid and unique
 static bool is_valid_unique_ssid(const char *new_ssid, pineap_network_t *network) {
@@ -995,20 +2244,16 @@ void wifi_pineap_detector_callback(void *buf, wifi_promiscuous_pkt_type_t type) 
             network->is_pineap = true;
             add_to_blacklist(hdr->addr3);
 
-            // Create new logging task if previous one has completed
-            if (network->log_task_handle == NULL) {
-                pineap_log_data_t *log_data = malloc(sizeof(pineap_log_data_t));
-                if (!log_data)
-                    return;
-
-                memcpy(log_data->bssid, network->bssid, 6);
-                log_data->network = network; // Pass network pointer for up-to-date info
-
-                BaseType_t result = xTaskCreate(log_pineap_detection, "pineap_log", 1024, log_data,
-                                                1, &network->log_task_handle);
-                if (result != pdPASS) {
-                    free(log_data);
-                    network->log_task_handle = NULL;
+            if (!network->log_pending && s_pineap_log_queue != NULL) {
+                pineap_log_event_t ev = {
+                    .network_index = (uint8_t)(network - pineap_networks),
+                    .due_ms = now_ms_u32() + 5000
+                };
+                network->log_due_ms = ev.due_ms;
+                network->log_pending = true;
+                if (xQueueSend(s_pineap_log_queue, &ev, 0) != pdTRUE) {
+                    network->log_pending = false;
+                    network->log_due_ms = 0;
                 }
             }
 
@@ -1033,6 +2278,8 @@ void gps_event_handler(void *event_handler_arg, esp_event_base_t event_base, int
     switch (event_id) {
     case GPS_UPDATE:
         gps = (gps_t *)event_data;
+        gps_manager_update_local_snapshot(gps);
+        gps_manager_note_update();
         gps_try_sync_time_from_fix(gps);
         
         // Add status display messages for GPS fix status
@@ -1162,13 +2409,16 @@ void wardriving_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
     }
 
     const wifi_promiscuous_pkt_t *pkt = (wifi_promiscuous_pkt_t *)buf;
-    const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)pkt->payload;
+    int len = pkt->rx_ctrl.sig_len;
+    if (len < 36) {
+        return;
+    }
+
+    const uint8_t *payload = pkt->payload;
+    const wifi_ieee80211_packet_t *ipkt = (wifi_ieee80211_packet_t *)payload;
     wifi_ieee80211_mac_hdr_t hdr_copy;
     memcpy(&hdr_copy, &ipkt->hdr, sizeof(wifi_ieee80211_mac_hdr_t));
     const wifi_ieee80211_mac_hdr_t *hdr = &hdr_copy;
-
-    const uint8_t *payload = pkt->payload;
-    int len = pkt->rx_ctrl.sig_len;
 
     uint8_t frame_type = hdr->frame_ctrl & 0xFC;
     if (frame_type != 0x80 && frame_type != 0x50) {
@@ -1179,8 +2429,17 @@ void wardriving_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
 
     int index = 36;
     char ssid[33] = {0};
+    bool ssid_ie_seen = false;
     uint8_t bssid[6];
     memcpy(bssid, hdr->addr3, 6);
+    if ((bssid[0] & 0x01) != 0) {
+        return;
+    }
+    static const uint8_t zero_bssid[6] = {0};
+    static const uint8_t ff_bssid[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
+    if (memcmp(bssid, zero_bssid, 6) == 0 || memcmp(bssid, ff_bssid, 6) == 0) {
+        return;
+    }
 
     int rssi = pkt->rx_ctrl.rssi;
     int channel = pkt->rx_ctrl.channel;
@@ -1203,10 +2462,11 @@ void wardriving_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
 
         /* sanity checks: ensure IE length is reasonable and within bounds */
         if (ie_len > MAX_IE_LEN || index + 2 + ie_len > len) {
-            break;
+            return;
         }
 
         if (id == 0 && ie_len <= 32) {
+            ssid_ie_seen = true;
             memcpy(ssid, &payload[index + 2], ie_len);
             ssid[ie_len] = '\0';
             trim_trailing(ssid);
@@ -1264,7 +2524,7 @@ void wardriving_scan_callback(void *buf, wifi_promiscuous_pkt_type_t type) {
             }
 rsn_done:
             
-        } else if (id == 221) {
+        } else if (id == 221 && ie_len >= 4) {
             uint32_t oui =
                 (payload[index + 2] << 16) | (payload[index + 3] << 8) | payload[index + 4];
             uint8_t oui_type = payload[index + 5];
@@ -1284,9 +2544,13 @@ rsn_done:
         }
     }
 
+    if (!ssid_ie_seen) {
+        return;
+    }
+
     if (!found_rsn && !found_wpa) {
         size_t copy_len = sizeof(encryption_type) - 1;
-        if (privacy_required) {
+        if (privacy_required && ssid_ie_seen) {
             strncpy(encryption_type, "WEP", copy_len);
         } else {
             strncpy(encryption_type, "OPEN", copy_len);
@@ -1294,12 +2558,25 @@ rsn_done:
         encryption_type[copy_len] = '\0';
     }
 
-    double latitude = 0;
-    double longitude = 0;
+    if (ssid_malformed) {
+        return;
+    }
 
-    if (gps != NULL) {
-        latitude = gps->latitude;
-        longitude = gps->longitude;
+    if (wardrive_role == WARDRIVE_ROLE_HELPER) {
+        const char *tx_ssid = (ssid[0] == '\0') ? "" : ssid;
+        if (wardrive_helper_should_send(bssid, (int8_t)rssi, tx_ssid)) {
+            bool send_ok = wardrive_send_helper_observation(bssid,
+                                                            (uint8_t)channel,
+                                                            (int8_t)rssi,
+                                                            wardrive_select_auth_code(encryption_type),
+                                                            tx_ssid);
+            if (send_ok) {
+                wardrive_helper_stream_send_ok++;
+            } else {
+                wardrive_helper_stream_send_fail++;
+            }
+        }
+        return;
     }
 
     wardriving_data_t wardriving_data = {0};
@@ -1310,8 +2587,6 @@ rsn_done:
              bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
     wardriving_data.rssi = rssi;
     wardriving_data.channel = channel;
-    wardriving_data.latitude = latitude;
-    wardriving_data.longitude = longitude;
     strncpy(wardriving_data.encryption_type, encryption_type,
             sizeof(wardriving_data.encryption_type) - 1);
     wardriving_data.encryption_type[sizeof(wardriving_data.encryption_type) - 1] = '\0';
@@ -1320,8 +2595,6 @@ rsn_done:
     if (ssid[0] == '\0') {
         strncpy(wardriving_data.ssid, "<hidden>", sizeof(wardriving_data.ssid) - 1);
         wardriving_data.ssid[sizeof(wardriving_data.ssid) - 1] = '\0';
-    } else if (ssid_malformed) {
-        return;
     }
 
     wardrive_log_attempts++;
@@ -1681,16 +2954,14 @@ void ble_wardriving_callback(struct ble_gap_event *event, void *arg) {
     }
 
     // Get GPS data from the global handle, if available
-    if (nmea_hdl != NULL) {
-        gps_t *gps_local = &((esp_gps_t *)nmea_hdl)->parent;
-        if (gps_local != NULL && gps_local->valid) {
-            wardriving_data.gps_quality.satellites_used = gps_local->sats_in_use;
-            wardriving_data.gps_quality.hdop = gps_local->dop_h;
-            wardriving_data.gps_quality.speed = gps_local->speed;
-            wardriving_data.gps_quality.course = gps_local->cog;
-            wardriving_data.gps_quality.fix_quality = gps_local->fix;
-            wardriving_data.gps_quality.has_valid_fix = (gps_local->fix >= GPS_FIX_GPS);
-        }
+    gps_t gps_local = {0};
+    if (gps_manager_get_local_gps_snapshot(&gps_local) && gps_local.valid) {
+        wardriving_data.gps_quality.satellites_used = gps_local.sats_in_use;
+        wardriving_data.gps_quality.hdop = gps_local.dop_h;
+        wardriving_data.gps_quality.speed = gps_local.speed;
+        wardriving_data.gps_quality.course = gps_local.cog;
+        wardriving_data.gps_quality.fix_quality = gps_local.fix;
+        wardriving_data.gps_quality.has_valid_fix = (gps_local.fix >= GPS_FIX_GPS);
     }
     
 

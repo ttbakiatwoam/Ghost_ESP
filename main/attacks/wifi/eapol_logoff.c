@@ -35,7 +35,6 @@ extern station_ap_pair_t selected_station;
 static volatile bool eapol_logoff_running = false;
 static volatile uint32_t eapol_logoff_packets_sent = 0;
 static TaskHandle_t eapol_logoff_task_handle = NULL;
-static TaskHandle_t eapol_logoff_display_task_handle = NULL;
 static uint32_t eapol_attack_delay_ms = 10;
 
 // Template for EAPOL Logoff frame: Data frame header + LLC/SNAP + EAPOL header
@@ -54,6 +53,8 @@ static const uint8_t eapol_logoff_frame_template[36] = {
 static void eapol_logoff_task(void *param) {
     (void)param;
     uint8_t frame[sizeof(eapol_logoff_frame_template)];
+    TickType_t last_log_tick = xTaskGetTickCount();
+    uint32_t last_log_total = 0;
     while (eapol_logoff_running) {
         // Copy template
         memcpy(frame, eapol_logoff_frame_template, sizeof(frame));
@@ -126,26 +127,20 @@ static void eapol_logoff_task(void *param) {
             eapol_logoff_running = false;
             break;
         }
+
+        TickType_t now = xTaskGetTickCount();
+        if ((now - last_log_tick) >= pdMS_TO_TICKS(5000)) {
+            uint32_t total = eapol_logoff_packets_sent;
+            uint32_t interval = total - last_log_total;
+            last_log_total = total;
+            last_log_tick = now;
+            uint32_t pps = interval / 5;
+            glog("EAPOL-Logoff: %lu/sec | Total: %lu\n", (unsigned long)pps, (unsigned long)total);
+        }
         
         vTaskDelay(pdMS_TO_TICKS(eapol_attack_delay_ms));
     }
     eapol_logoff_task_handle = NULL;
-    vTaskDelete(NULL);
-}
-
-static void eapol_logoff_display_task(void *param) {
-    (void)param;
-    uint32_t prev_total = 0;
-    while (eapol_logoff_running) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
-        uint32_t total = eapol_logoff_packets_sent;
-        uint32_t interval = total - prev_total;
-        prev_total = total;
-        uint32_t pps = interval / 5;
-        
-        glog("EAPOL-Logoff: %lu/sec | Total: %lu\n", (unsigned long)pps, (unsigned long)total);
-    }
-    eapol_logoff_display_task_handle = NULL;
     vTaskDelete(NULL);
 }
 
@@ -166,8 +161,19 @@ void eapol_logoff_start(void) {
 #ifdef CONFIG_WITH_STATUS_DISPLAY
     status_display_show_attack("EAPOL logoff", "running");
 #endif
-    xTaskCreate(eapol_logoff_task, "eapol_logoff", 2048, NULL, 5, &eapol_logoff_task_handle);
-    xTaskCreate(eapol_logoff_display_task, "eapol_disp", 3072, NULL, 5, &eapol_logoff_display_task_handle);
+    BaseType_t attack_rc = xTaskCreate(eapol_logoff_task, "eapol_logoff", 2048, NULL, 5, &eapol_logoff_task_handle);
+    if (attack_rc != pdPASS) {
+        glog("EAPOL Logoff failed to start (attack=%ld)\n", (long)attack_rc);
+        eapol_logoff_running = false;
+        if (eapol_logoff_task_handle) {
+            vTaskDelete(eapol_logoff_task_handle);
+            eapol_logoff_task_handle = NULL;
+        }
+#ifdef CONFIG_WITH_STATUS_DISPLAY
+        status_display_show_status("EAPOL start failed");
+#endif
+        return;
+    }
 }
 
 void eapol_logoff_stop(void) {
@@ -185,13 +191,6 @@ void eapol_logoff_stop(void) {
     if (eapol_logoff_task_handle) {
         TaskHandle_t temp_handle = eapol_logoff_task_handle;
         eapol_logoff_task_handle = NULL;
-        vTaskDelete(temp_handle);
-    }
-    
-    // Delete display task if still exists  
-    if (eapol_logoff_display_task_handle) {
-        TaskHandle_t temp_handle = eapol_logoff_display_task_handle;
-        eapol_logoff_display_task_handle = NULL;
         vTaskDelete(temp_handle);
     }
     

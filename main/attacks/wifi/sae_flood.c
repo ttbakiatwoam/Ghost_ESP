@@ -755,8 +755,25 @@ void sae_flood_start(const char *password) {
     wifi_manager_start_monitor_mode(sae_monitor_callback);
     esp_wifi_set_channel(sae_target_channel, WIFI_SECOND_CHAN_NONE);
 
-    xTaskCreate(sae_flood_task, "sae_flood_task", 3072, NULL, 5, &sae_flood_task_handle);
-    xTaskCreate(sae_flood_display_task, "sae_displ", 2048, NULL, 3, &sae_flood_display_task_handle);
+    BaseType_t attack_rc = xTaskCreate(sae_flood_task, "sae_flood_task", 3072, NULL, 5, &sae_flood_task_handle);
+    BaseType_t display_rc = xTaskCreate(sae_flood_display_task, "sae_displ", 2048, NULL, 3, &sae_flood_display_task_handle);
+    if (attack_rc != pdPASS || display_rc != pdPASS) {
+        glog("SAE flood failed to start tasks (attack=%ld, display=%ld)\n", (long)attack_rc, (long)display_rc);
+        sae_flood_running = false;
+        if (sae_flood_task_handle != NULL) {
+            vTaskDelete(sae_flood_task_handle);
+            sae_flood_task_handle = NULL;
+        }
+        if (sae_flood_display_task_handle != NULL) {
+            vTaskDelete(sae_flood_display_task_handle);
+            sae_flood_display_task_handle = NULL;
+        }
+        wifi_manager_stop_monitor_mode();
+#ifdef CONFIG_WITH_STATUS_DISPLAY
+        status_display_show_status("SAE start failed");
+#endif
+        return;
+    }
 
     char bssid_str[18];
     snprintf(bssid_str, sizeof(bssid_str), "%02x:%02x:%02x:%02x:%02x:%02x",
@@ -777,11 +794,19 @@ void sae_flood_stop(void) {
 
     sae_flood_running = false;
     
-    if (sae_flood_task_handle) {
+    int wait_count = 0;
+    while ((sae_flood_task_handle != NULL || sae_flood_display_task_handle != NULL) && wait_count < 30) {
         vTaskDelay(pdMS_TO_TICKS(100));
+        wait_count++;
     }
-    if (sae_flood_display_task_handle) {
-        vTaskDelay(pdMS_TO_TICKS(100));
+
+    if (sae_flood_task_handle != NULL) {
+        vTaskDelete(sae_flood_task_handle);
+        sae_flood_task_handle = NULL;
+    }
+    if (sae_flood_display_task_handle != NULL) {
+        vTaskDelete(sae_flood_display_task_handle);
+        sae_flood_display_task_handle = NULL;
     }
     
     wifi_manager_stop_monitor_mode();

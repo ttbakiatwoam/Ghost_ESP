@@ -20,6 +20,8 @@
 #include "host/ble_gap.h"
 #include "host/ble_hs.h"
 #include "nimble/ble.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -60,6 +62,8 @@ static FlipperDevice discovered_flippers[MAX_FLIPPERS];
 static int discovered_flipper_count = 0;
 static int selected_flipper_index = -1;
 static volatile bool flipper_scan_active = false;
+static TickType_t flipper_adv_last_log_tick = 0;
+static uint32_t flipper_adv_suppressed_logs = 0;
 
 // External RGB manager
 extern RGBManager_t rgb_manager;
@@ -255,6 +259,7 @@ static const char *detect_flipper_type_from_adv(const uint8_t *data, size_t len)
  * @param len Length of event data
  */
 static void ble_findtheflippers_callback(struct ble_gap_event *event, size_t len) {
+    (void)len;
     int advertisementRssi = event->disc.rssi;
 
     char advertisementMac[18];
@@ -265,13 +270,23 @@ static void ble_findtheflippers_callback(struct ble_gap_event *event, size_t len
                           sizeof(advertisementName));
 
     const char *type_str = detect_flipper_type_from_adv(event->disc.data, event->disc.length_data);
-    ESP_LOGI(TAG,
-             "FindFlippers: MAC=%s RSSI=%d len=%u name='%s' type=%s",
-             advertisementMac,
-             advertisementRssi,
-             (unsigned int)event->disc.length_data,
-             (advertisementName[0] != '\0') ? advertisementName : "<none>",
-             type_str ? type_str : "<null>");
+    TickType_t now = xTaskGetTickCount();
+    if (flipper_adv_last_log_tick == 0 ||
+        (now - flipper_adv_last_log_tick) >= pdMS_TO_TICKS(1000)) {
+        ESP_LOGI(TAG,
+                 "FindFlippers: MAC=%s RSSI=%d len=%u name='%s' type=%s (suppressed=%lu)",
+                 advertisementMac,
+                 advertisementRssi,
+                 (unsigned int)event->disc.length_data,
+                 (advertisementName[0] != '\0') ? advertisementName : "<none>",
+                 type_str ? type_str : "<null>",
+                 (unsigned long)flipper_adv_suppressed_logs);
+        flipper_adv_last_log_tick = now;
+        flipper_adv_suppressed_logs = 0;
+    } else {
+        flipper_adv_suppressed_logs++;
+    }
+
     if (!type_str) {
         return;
     }
@@ -304,7 +319,6 @@ static void ble_findtheflippers_callback(struct ble_gap_event *event, size_t len
              "     RSSI: %d dBm\n",
              discovered_flipper_count, type_str,
              advertisementMac, advertisementName, advertisementRssi);
-        pulse_once(&rgb_manager, 0, 255, 0);
         discovered_flipper_count++;
     }
 }
@@ -322,6 +336,8 @@ void flipper_scan_start(void) {
     discovered_flipper_count = 0;
     selected_flipper_index = -1;
     flipper_scan_active = true;
+    flipper_adv_last_log_tick = 0;
+    flipper_adv_suppressed_logs = 0;
 
     ESP_LOGI(TAG, "Find Flippers: registering handler and starting BLE scan");
     ble_register_handler(ble_findtheflippers_callback);

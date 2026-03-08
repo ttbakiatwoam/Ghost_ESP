@@ -3,6 +3,8 @@
 
 #include "esp_err.h"
 #include <stdbool.h>
+#include <stddef.h>
+#include "managers/sd_card_manager.h"
 
 /**
  * Set Wigle API credentials (format: "APIName:APIToken" from wigle.net/account)
@@ -34,6 +36,35 @@ void wigle_queue_add(const char *filepath);
 void wigle_upload_all_async(void);
 
 /**
+ * List CSV files under /mnt/ghostesp/gps with pagination.
+ * Returns number of entries copied to out_names, or -1 on error.
+ */
+int wigle_list_csv_files_paged(int offset, int max_count,
+                               char (*out_names)[MAX_PORTAL_NAME],
+                               bool *out_has_more);
+
+/**
+ * Get basic info for a GPS CSV file by basename.
+ * out_wifi_rows / out_total_rows are optional.
+ */
+esp_err_t wigle_get_csv_info(const char *filename, int *out_wifi_rows, int *out_total_rows);
+
+/**
+ * Upload one CSV file (basename in /mnt/ghostesp/gps) and provide a user-facing message.
+ */
+esp_err_t wigle_upload_single_csv(const char *filename, char *message, size_t message_len);
+
+/**
+ * Start async upload for one CSV basename in /mnt/ghostesp/gps.
+ */
+esp_err_t wigle_upload_single_csv_async(const char *filename);
+
+/**
+ * Check if a manual WiGLE file upload is in progress.
+ */
+bool wigle_is_manual_upload_in_progress(void);
+
+/**
  * Callback type for wigle_test_api_key result.
  */
 typedef void (*wigle_test_callback_t)(bool success, const char *message);
@@ -44,9 +75,24 @@ typedef void (*wigle_test_callback_t)(bool success, const char *message);
 void wigle_set_test_callback(wigle_test_callback_t callback);
 
 /**
+ * Set callback for manual single-file upload result.
+ */
+void wigle_set_manual_upload_callback(wigle_test_callback_t callback);
+
+/**
+ * Set callback for WiGLE stats fetch result.
+ */
+void wigle_set_stats_callback(wigle_test_callback_t callback);
+
+/**
  * Check if a WiGLE API test is already in progress.
  */
 bool wigle_is_test_in_progress(void);
+
+/**
+ * Check if a WiGLE stats request is currently in progress.
+ */
+bool wigle_is_stats_in_progress(void);
 
 /**
  * Test WiGLE API key validity by making a request to the profile endpoint.
@@ -54,5 +100,15 @@ bool wigle_is_test_in_progress(void);
  * @return ESP_OK if test initiated, ESP_ERR_INVALID_ARG if no key provided
  */
 esp_err_t wigle_test_api_key(void);
+
+/**
+ * Fetch and format WiGLE stats for the current account.
+ */
+esp_err_t wigle_get_stats(char *message, size_t message_len);
+
+/**
+ * Start async WiGLE stats fetch for the current account.
+ */
+esp_err_t wigle_get_stats_async(void);
 
 #endif /* WIGLE_MANAGER_H */

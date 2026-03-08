@@ -28,6 +28,7 @@
 
 static const char *TAG = "SD_Card_Manager";
 static const char *NVS_NAMESPACE = "sd_config";
+static bool s_sd_log_levels_tuned = false;
 
 /* time multiplex spi when display and sd share the spi bus */
 #if defined(CONFIG_WITH_SCREEN) && defined(CONFIG_LV_TFT_DISPLAY_PROTOCOL_SPI) && !defined(CONFIG_USE_TDISPLAY_S3)
@@ -41,12 +42,9 @@ static const char *NVS_NAMESPACE = "sd_config";
 #endif
 #include "managers/display_manager.h"
 static bool s_display_spi_suspended_flag = false;
-static bool is_shared_display_sd_spi(void) {
-#if !defined(CONFIG_IDF_TARGET_ESP32) && defined(CONFIG_LV_TFT_DISPLAY_SPI2_HOST)
-  /* On all non-ESP32 SPI targets the SD mount always uses SPI2_HOST.
-   * If the display is also configured on SPI2_HOST the buses are shared. */
-  return true;
-#elif defined(CONFIG_LV_DISP_SPI_MOSI) && defined(CONFIG_LV_DISP_SPI_CLK)
+
+static bool display_sd_spi_pins_match(void) {
+#if defined(CONFIG_LV_DISP_SPI_MOSI) && defined(CONFIG_LV_DISP_SPI_CLK)
   bool mosi_match = (sd_card_manager.spi_mosi_pin == CONFIG_LV_DISP_SPI_MOSI);
   bool clk_match = (sd_card_manager.spi_clk_pin == CONFIG_LV_DISP_SPI_CLK);
 #if defined(CONFIG_LV_DISP_SPI_MISO)
@@ -59,6 +57,21 @@ static bool is_shared_display_sd_spi(void) {
   return false;
 #endif
 }
+
+static bool is_shared_display_sd_spi(void) {
+#if (defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)) && defined(CONFIG_LV_TFT_DISPLAY_SPI2_HOST)
+  /* These targets mount SD on SPI2_HOST, so a display on SPI2_HOST must be
+   * time-multiplexed even when the display and SD use different pins. */
+  return true;
+#else
+  return display_sd_spi_pins_match();
+#endif
+}
+
+static bool display_spi_requires_rebind_for_sd(void) {
+  return is_shared_display_sd_spi() && !display_sd_spi_pins_match();
+}
+
 static bool display_spi_suspend_for_sd(void) {
   if (!is_shared_display_sd_spi()) {
     return false;
@@ -109,9 +122,46 @@ static void display_spi_resume_after_sd(void) {
   s_display_spi_suspended_flag = false;
 }
 #else
+static bool display_sd_spi_pins_match(void) { return false; }
+static bool is_shared_display_sd_spi(void) { return false; }
+static bool display_spi_requires_rebind_for_sd(void) { return false; }
 static bool display_spi_suspend_for_sd(void) { return false; }
 static void display_spi_resume_after_sd(void) {}
 #endif
+
+static inline void shared_spi_guard_resume_lvgl_if_needed(bool guard_active) {
+#if defined(CONFIG_WITH_SCREEN) && defined(CONFIG_LV_TFT_DISPLAY_PROTOCOL_SPI) && !defined(CONFIG_USE_TDISPLAY_S3)
+  if (guard_active) display_manager_resume_lvgl_task();
+#else
+  (void)guard_active;
+#endif
+}
+
+static const char *sd_spi_host_name(int host_id) {
+  switch (host_id) {
+    case SPI2_HOST:
+      return "SPI2_HOST";
+#if defined(SPI3_HOST)
+    case SPI3_HOST:
+      return "SPI3_HOST";
+#endif
+    default:
+      return "SPI_HOST?";
+  }
+}
+
+static int sd_spi_host_id(void) {
+#if defined(CONFIG_WITH_SCREEN) && defined(CONFIG_LV_TFT_DISPLAY_PROTOCOL_SPI) && defined(TFT_SPI_HOST)
+  if (is_shared_display_sd_spi()) {
+    return TFT_SPI_HOST;
+  }
+#endif
+#if defined(CONFIG_IDF_TARGET_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S3)
+  return SPI3_HOST;
+#else
+  return SPI2_HOST;
+#endif
+}
 
 
 
@@ -139,6 +189,38 @@ static int s_spi_host_id = -1;
 typedef enum { MOUNT_NONE = 0, MOUNT_VIRTUAL, MOUNT_SDMMC, MOUNT_SPI } sd_mount_type_t;
 static sd_mount_type_t s_mount_type = MOUNT_NONE;
 static TickType_t s_next_unmount_tick = 0;
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+static int choose_free_s3_sd_spi_host(const spi_bus_config_t *bus_config, int dma_channel) {
+  int preferred_hosts[] = { SPI3_HOST, SPI2_HOST };
+
+  for (size_t i = 0; i < sizeof(preferred_hosts) / sizeof(preferred_hosts[0]); ++i) {
+    int host_id = preferred_hosts[i];
+    esp_err_t probe_ret = spi_bus_initialize(host_id, bus_config, dma_channel);
+    if (probe_ret == ESP_OK) {
+      s_spi_bus_initialized = true;
+      s_spi_host_id = host_id;
+      ESP_LOGI(TAG, "Selected free SD SPI host: %s", sd_spi_host_name(host_id));
+      return host_id;
+    }
+    if (probe_ret != ESP_ERR_INVALID_STATE) {
+      ESP_LOGW(TAG, "SPI host probe failed for %s: %s",
+               sd_spi_host_name(host_id),
+               esp_err_to_name(probe_ret));
+    }
+  }
+
+  return -1;
+}
+#endif
+
+static void sd_spi_bus_release_if_tracked(void) {
+  if (s_spi_bus_initialized && s_spi_host_id >= 0) {
+    spi_bus_free(s_spi_host_id);
+    s_spi_bus_initialized = false;
+    s_spi_host_id = -1;
+  }
+}
 
 static sd_card_cached_stats_t s_cached_stats = { .valid = false, .used_pct = 0 };
 
@@ -285,6 +367,22 @@ static void sdmmc_card_print_info(const sdmmc_card_t *card) {
 esp_err_t sd_card_init(void) {
   esp_err_t ret = ESP_FAIL;
 
+  if (!s_sd_log_levels_tuned) {
+    esp_log_level_set("sdspi_transaction", ESP_LOG_WARN);
+    s_sd_log_levels_tuned = true;
+  }
+
+  if (sd_card_manager.is_initialized) {
+    ESP_LOGI(TAG, "sd_card_init: already initialized");
+    return ESP_OK;
+  }
+
+  /* Clean up stale tracked SPI state before a fresh init attempt. */
+  if (s_mount_type == MOUNT_SPI && s_spi_bus_initialized) {
+    sd_spi_bus_release_if_tracked();
+  }
+  sd_card_manager.card = NULL;
+
 
 #ifdef CONFIG_IS_S3TWATCH
   ESP_LOGI(TAG, "S3TWatch detected - attempting virtual storage mount");
@@ -355,6 +453,8 @@ esp_err_t sd_card_init(void) {
 
   sd_card_setup_directory_structure();
 
+  return ESP_OK;
+
 #elif defined(CONFIG_USING_MMC)
 
   printf("Initializing SD card in SDMMC mode (4-bit) using configured pins...\n");
@@ -405,16 +505,32 @@ esp_err_t sd_card_init(void) {
   printf("SD card initialized successfully\n");
 
   sd_card_setup_directory_structure();
+
+  return ESP_OK;
 #elif CONFIG_USING_SPI
 
   printf("Initializing SD card in SPI mode using configured pins...\n");
+
+  bool shared_spi_guard_active = false;
+  bool display_rebind_required = false;
+#if defined(CONFIG_WITH_SCREEN) && defined(CONFIG_LV_TFT_DISPLAY_PROTOCOL_SPI) && !defined(CONFIG_USE_TDISPLAY_S3)
+  display_rebind_required = display_spi_requires_rebind_for_sd();
+  if (is_shared_display_sd_spi() && !display_rebind_required) {
+    shared_spi_guard_active = true;
+    display_manager_suspend_lvgl_task();
+    disp_wait_for_pending_transactions();
+#ifdef CONFIG_LV_DISP_SPI_CS
+    gpio_set_level(CONFIG_LV_DISP_SPI_CS, 1);
+#endif
+  }
+#endif
 
   bool gating_template = false;
 #ifdef CONFIG_BUILD_CONFIG_TEMPLATE
   gating_template = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
 #endif
   bool display_was_suspended = false;
-  if (gating_template) {
+  if (gating_template || display_rebind_required) {
     display_was_suspended = display_spi_suspend_for_sd();
   }
 
@@ -500,11 +616,11 @@ esp_err_t sd_card_init(void) {
   host.max_freq_khz = 4000;       /* 4 MHz for first probe – increase later if needed */
 #elif defined(CONFIG_IDF_TARGET_ESP32C5)
   host.max_freq_khz = 4000;       /* 4 MHz for ESP32-C5 to avoid timeout issues */
+#elif defined(CONFIG_SHARED_TFT_SD_SPI)
+  host.max_freq_khz = 4000;       /* more reliable init on shared SPI bus boards */
 #endif
   /* select spi host slot for target */
-#if defined(CONFIG_IDF_TARGET_ESP32C5)
-  host.slot = SPI2_HOST;
-#endif
+  host.slot = sd_spi_host_id();
 
   spi_bus_config_t bus_config;
 
@@ -516,6 +632,11 @@ esp_err_t sd_card_init(void) {
   /* reduce dma pressure for sd spi */
   bus_config.max_transfer_sz = 8192;
 
+  /* Keep CS idle-high before card probe to avoid false command framing. */
+  gpio_set_direction(sd_card_manager.spi_cs_pin, GPIO_MODE_OUTPUT);
+  gpio_set_level(sd_card_manager.spi_cs_pin, 1);
+  vTaskDelay(pdMS_TO_TICKS(2));
+
 #ifdef CONFIG_IDF_TARGET_ESP32
   int dmabus = 2;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
@@ -525,6 +646,11 @@ esp_err_t sd_card_init(void) {
 #endif
 
   bool bus_init_success = false;
+  int sd_host_id = sd_spi_host_id();
+
+  ESP_LOGI(TAG, "SD SPI host selected: %s (shared=%d, pins_match=%d)",
+           sd_spi_host_name(sd_host_id),
+           is_shared_display_sd_spi(), display_sd_spi_pins_match());
 
 #if defined(CONFIG_IDF_TARGET_ESP32C5)
   {
@@ -534,6 +660,7 @@ esp_err_t sd_card_init(void) {
       s_spi_bus_initialized = true;
       s_spi_host_id = SPI2_HOST;
     } else if (bus_ret != ESP_ERR_INVALID_STATE) {
+      shared_spi_guard_resume_lvgl_if_needed(shared_spi_guard_active);
       printf("Failed to initialize SPI bus: %s\n", esp_err_to_name(bus_ret));
       return bus_ret;
     }
@@ -542,24 +669,45 @@ esp_err_t sd_card_init(void) {
 #if !defined(CONFIG_ENCODER_INA)
 #if defined(CONFIG_IDF_TARGET_ESP32)
   {
-    esp_err_t bus_ret = spi_bus_initialize(SPI3_HOST, &bus_config, dmabus);
+    esp_err_t bus_ret = spi_bus_initialize(sd_host_id, &bus_config, dmabus);
     if (bus_ret == ESP_OK) {
       bus_init_success = true;
+      s_spi_bus_initialized = true;
+      s_spi_host_id = sd_host_id;
     } else if (bus_ret != ESP_ERR_INVALID_STATE) {
+      shared_spi_guard_resume_lvgl_if_needed(shared_spi_guard_active);
       printf("Failed to initialize SPI bus: %s\n", esp_err_to_name(bus_ret));
       return bus_ret;
     }
   }
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
   {
-    esp_err_t bus_ret = spi_bus_initialize(SPI2_HOST, &bus_config, dmabus);
-    if (bus_ret == ESP_OK) {
+    int host_id = sd_host_id;
+    if (!is_shared_display_sd_spi()) {
+      host_id = choose_free_s3_sd_spi_host(&bus_config, dmabus);
+      if (host_id < 0) {
+        shared_spi_guard_resume_lvgl_if_needed(shared_spi_guard_active);
+        printf("Failed to find a free SPI host for SD on ESP32-S3\n");
+        return ESP_ERR_INVALID_STATE;
+      }
       bus_init_success = true;
-      s_spi_bus_initialized = true;
-      s_spi_host_id = SPI2_HOST;
-    } else if (bus_ret != ESP_ERR_INVALID_STATE) {
-      printf("Failed to initialize SPI bus: %s\n", esp_err_to_name(bus_ret));
-      return bus_ret;
+      sd_host_id = host_id;
+    } else {
+      esp_err_t bus_ret = spi_bus_initialize(host_id, &bus_config, dmabus);
+      if (bus_ret == ESP_OK) {
+        bus_init_success = true;
+        s_spi_bus_initialized = true;
+        s_spi_host_id = host_id;
+      } else if (bus_ret != ESP_ERR_INVALID_STATE) {
+        shared_spi_guard_resume_lvgl_if_needed(shared_spi_guard_active);
+        printf("Failed to initialize SPI bus: %s\n", esp_err_to_name(bus_ret));
+        return bus_ret;
+      }
+    }
+
+    if (host_id >= 0 && !s_spi_bus_initialized && !bus_init_success) {
+      /* host already initialized elsewhere; reuse it */
+      sd_host_id = host_id;
     }
   }
 #else
@@ -570,6 +718,7 @@ esp_err_t sd_card_init(void) {
       s_spi_bus_initialized = true;
       s_spi_host_id = SPI2_HOST;
     } else if (bus_ret != ESP_ERR_INVALID_STATE) {
+      shared_spi_guard_resume_lvgl_if_needed(shared_spi_guard_active);
       printf("Failed to initialize SPI bus: %s\n", esp_err_to_name(bus_ret));
       return bus_ret;
     }
@@ -586,13 +735,9 @@ esp_err_t sd_card_init(void) {
   sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot_config.gpio_cs = sd_card_manager.spi_cs_pin;
 #if defined(CONFIG_IDF_TARGET_ESP32)
-  slot_config.host_id = SPI3_HOST;
+  slot_config.host_id = sd_host_id;
 #elif defined(CONFIG_IDF_TARGET_ESP32S3)
-#if defined(CONFIG_ENCODER_INA)
-  slot_config.host_id = SPI3_HOST; // use spi3_host (vspi) for sd if encoder is active on esp32s3
-#else
-  slot_config.host_id = SPI2_HOST;
-#endif
+  slot_config.host_id = sd_host_id;
 #elif defined(CONFIG_IDF_TARGET_ESP32C5)
   slot_config.host_id = SPI2_HOST;
 #else
@@ -601,14 +746,18 @@ esp_err_t sd_card_init(void) {
 
   ret = esp_vfs_fat_sdspi_mount("/mnt", &host, &slot_config, &mount_config,
                                 &sd_card_manager.card);
+  if (ret == ESP_ERR_INVALID_RESPONSE || ret == ESP_ERR_INVALID_SIZE) {
+    ESP_LOGW(TAG, "First SD probe failed (%s), retrying at lower SPI frequency", esp_err_to_name(ret));
+    host.max_freq_khz = 4000;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    ret = esp_vfs_fat_sdspi_mount("/mnt", &host, &slot_config, &mount_config,
+                                  &sd_card_manager.card);
+  }
+  shared_spi_guard_resume_lvgl_if_needed(shared_spi_guard_active);
   if (ret != ESP_OK) {
     printf("Failed to mount filesystem: %s\n", esp_err_to_name(ret));
     if (bus_init_success) {
-      if (s_spi_bus_initialized && s_spi_host_id >= 0) {
-        spi_bus_free(s_spi_host_id);
-        s_spi_bus_initialized = false;
-        s_spi_host_id = -1;
-      }
+      sd_spi_bus_release_if_tracked();
     }
     if (display_was_suspended) {
       display_spi_resume_after_sd();
@@ -631,6 +780,8 @@ esp_err_t sd_card_init(void) {
     }
     return ESP_OK;
   }
+
+  return ESP_OK;
 
 #endif
 
@@ -665,8 +816,8 @@ esp_err_t sd_card_mount_for_flush(bool *display_was_suspended) {
   if (display_was_suspended) *display_was_suspended = display_spi_suspend_for_sd();
   // Minimal SPI mount path for flush: reuse sd_card_init SPI branch logic
   sdmmc_host_t host = SDSPI_HOST_DEFAULT();
+  host.slot = sd_spi_host_id();
 #if defined(CONFIG_IDF_TARGET_ESP32C5)
-  host.slot = SPI2_HOST;
   host.max_freq_khz = 4000;       /* 4 MHz for ESP32-C5 to avoid timeout issues */
 #endif
 
@@ -676,6 +827,10 @@ esp_err_t sd_card_mount_for_flush(bool *display_was_suspended) {
   bus_config.sclk_io_num = sd_card_manager.spi_clk_pin;
   bus_config.max_transfer_sz = 8192;
 
+  gpio_set_direction(sd_card_manager.spi_cs_pin, GPIO_MODE_OUTPUT);
+  gpio_set_level(sd_card_manager.spi_cs_pin, 1);
+  vTaskDelay(pdMS_TO_TICKS(2));
+
 #if defined(CONFIG_IDF_TARGET_ESP32)
   int dmabus = 2;
 #else
@@ -683,19 +838,16 @@ esp_err_t sd_card_mount_for_flush(bool *display_was_suspended) {
 #endif
 
   if (!s_spi_bus_initialized) {
-    int host_id =
-#if defined(CONFIG_IDF_TARGET_ESP32)
-      SPI3_HOST;
-#else
-      SPI2_HOST;
-#endif
+    int host_id = sd_spi_host_id();
     esp_err_t bus_ret = spi_bus_initialize(host_id, &bus_config, dmabus);
     if (bus_ret != ESP_OK && bus_ret != ESP_ERR_INVALID_STATE) {
       if (display_was_suspended && *display_was_suspended) display_spi_resume_after_sd();
       return bus_ret;
     }
-    s_spi_bus_initialized = true;
-    s_spi_host_id = host_id;
+    if (bus_ret == ESP_OK) {
+      s_spi_bus_initialized = true;
+      s_spi_host_id = host_id;
+    }
   }
 
   esp_vfs_fat_sdmmc_mount_config_t mount_config = {
@@ -705,20 +857,18 @@ esp_err_t sd_card_mount_for_flush(bool *display_was_suspended) {
 
   sdspi_device_config_t slot_config = SDSPI_DEVICE_CONFIG_DEFAULT();
   slot_config.gpio_cs = sd_card_manager.spi_cs_pin;
-#if defined(CONFIG_IDF_TARGET_ESP32)
-  slot_config.host_id = SPI3_HOST;
-#else
-  slot_config.host_id = SPI2_HOST;
-#endif
+  slot_config.host_id = sd_spi_host_id();
 
   esp_err_t ret = esp_vfs_fat_sdspi_mount("/mnt", &host, &slot_config, &mount_config,
                                 &sd_card_manager.card);
+  if (ret == ESP_ERR_INVALID_RESPONSE || ret == ESP_ERR_INVALID_SIZE) {
+    host.max_freq_khz = 4000;
+    vTaskDelay(pdMS_TO_TICKS(30));
+    ret = esp_vfs_fat_sdspi_mount("/mnt", &host, &slot_config, &mount_config,
+                                  &sd_card_manager.card);
+  }
   if (ret != ESP_OK) {
-    if (s_spi_bus_initialized && s_spi_host_id >= 0) {
-      spi_bus_free(s_spi_host_id);
-      s_spi_bus_initialized = false;
-      s_spi_host_id = -1;
-    }
+    sd_spi_bus_release_if_tracked();
     if (display_was_suspended && *display_was_suspended) display_spi_resume_after_sd();
     return ret;
   }
@@ -776,6 +926,9 @@ void sd_card_unmount_with_context(sd_unmount_context_t context) {
 #if SOC_SDMMC_HOST_SUPPORTED && SOC_SDMMC_USE_GPIO_MATRIX
   if (sd_card_manager.is_initialized) {
     esp_vfs_fat_sdcard_unmount("/mnt", sd_card_manager.card);
+    if (s_mount_type == MOUNT_SPI) {
+      sd_spi_bus_release_if_tracked();
+    }
     printf("SD card unmounted\n");
     sd_card_manager.is_initialized = false;
     sd_card_manager.card = NULL;
@@ -801,11 +954,7 @@ void sd_card_unmount_with_context(sd_unmount_context_t context) {
 #else
   if (sd_card_manager.is_initialized) {
     esp_vfs_fat_sdcard_unmount("/mnt", sd_card_manager.card);
-    if (s_spi_bus_initialized && s_spi_host_id >= 0) {
-      spi_bus_free(s_spi_host_id);
-      s_spi_bus_initialized = false;
-      s_spi_host_id = -1;
-    }
+    sd_spi_bus_release_if_tracked();
     printf("SD card unmounted\n");
     sd_card_manager.is_initialized = false;
     sd_card_manager.card = NULL;
@@ -850,8 +999,14 @@ esp_err_t sd_card_append_file(const char *path, const void *data, size_t size) {
     printf("Failed to open file for appending\n");
     return ESP_FAIL;
   }
-  fwrite(data, 1, size, f);
+  size_t written = fwrite(data, 1, size, f);
+  int write_failed = ferror(f);
   fclose(f);
+  if (write_failed || written != size) {
+    printf("Failed to append full data to file: %s (%zu/%zu bytes)\n", path, written,
+           size);
+    return ESP_FAIL;
+  }
   printf("Data appended to file: %s\n", path);
   return ESP_OK;
 }
@@ -867,8 +1022,13 @@ esp_err_t sd_card_write_file(const char *path, const void *data, size_t size) {
     printf("Failed to open file for writing\n");
     return ESP_FAIL;
   }
-  fwrite(data, 1, size, f);
+  size_t written = fwrite(data, 1, size, f);
+  int write_failed = ferror(f);
   fclose(f);
+  if (write_failed || written != size) {
+    printf("Failed to write full file: %s (%zu/%zu bytes)\n", path, written, size);
+    return ESP_FAIL;
+  }
   printf("File written: %s\n", path);
   return ESP_OK;
 }
@@ -972,6 +1132,8 @@ static esp_err_t ensure_sd_dir_exists(const char *path) {
 
 esp_err_t sd_card_setup_directory_structure() {
   const char *root_dir = "/mnt/ghostesp";
+  const char *logs_dir = "/mnt/ghostesp/logs";
+  const char *coredumps_dir = "/mnt/ghostesp/logs/coredumps";
   const char *debug_dir = "/mnt/ghostesp/debug";
   const char *pcaps_dir = "/mnt/ghostesp/pcaps";
   const char *scans_dir = "/mnt/ghostesp/scans";
@@ -991,6 +1153,12 @@ esp_err_t sd_card_setup_directory_structure() {
   if (ret != ESP_OK) return ret;
 
   ret = ensure_sd_dir_exists(gps_dir);
+  if (ret != ESP_OK) return ret;
+
+  ret = ensure_sd_dir_exists(logs_dir);
+  if (ret != ESP_OK) return ret;
+
+  ret = ensure_sd_dir_exists(coredumps_dir);
   if (ret != ESP_OK) return ret;
 
   ret = ensure_sd_dir_exists(debug_dir);
@@ -1273,4 +1441,58 @@ int get_evil_portal_list(char portal_names[MAX_PORTALS][MAX_PORTAL_NAME]) {
     }
     closedir(dir);
     return count;
+}
+
+int sd_card_list_dir_paged(const char *dir_path, const char *ext,
+                            int offset, int max_count,
+                            char (*out_names)[MAX_PORTAL_NAME],
+                            bool *out_has_more) {
+    if (out_has_more) *out_has_more = false;
+    if (!dir_path || !out_names || max_count <= 0) return -1;
+
+    DIR *dir = opendir(dir_path);
+    if (!dir) {
+        ESP_LOGW(TAG, "sd_card_list_dir_paged: failed to open '%s'", dir_path);
+        return -1;
+    }
+
+    struct dirent *entry;
+    int skipped   = 0;
+    int collected = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        /* ---- regular-file check (FAT may return DT_UNKNOWN) ---- */
+        bool is_reg = (entry->d_type == DT_REG);
+        if (!is_reg && entry->d_type == DT_UNKNOWN) {
+            char fullpath[256];
+            int n = snprintf(fullpath, sizeof(fullpath), "%s/%s", dir_path, entry->d_name);
+            if (n > 0 && n < (int)sizeof(fullpath)) {
+                struct stat st;
+                if (stat(fullpath, &st) == 0 && S_ISREG(st.st_mode)) is_reg = true;
+            }
+        }
+        if (!is_reg) continue;
+
+        /* ---- optional extension filter ---- */
+        if (ext) {
+            const char *dot = strrchr(entry->d_name, '.');
+            if (!dot || strcmp(dot, ext) != 0) continue;
+        }
+
+        /* ---- pagination ---- */
+        if (skipped < offset) { skipped++; continue; }
+
+        if (collected < max_count) {
+            strncpy(out_names[collected], entry->d_name, MAX_PORTAL_NAME - 1);
+            out_names[collected][MAX_PORTAL_NAME - 1] = '\0';
+            collected++;
+        } else {
+            /* one extra entry confirms a following page exists */
+            if (out_has_more) *out_has_more = true;
+            break;
+        }
+    }
+
+    closedir(dir);
+    return collected;
 }

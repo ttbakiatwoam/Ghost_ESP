@@ -13,6 +13,7 @@
 #include "esp_http_client.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
+#include <cJSON.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -32,21 +33,41 @@
 #define WIGLE_QUEUE_BATCH_MAX 16
 #define WIGLE_STREAM_CHUNK_SIZE 4096
 #define AUTH_BUF_SIZE 256
-#define WIGLE_RESP_BUF_SIZE 384
+#define WIGLE_RESP_BUF_SIZE 2048
 #define WIGLE_TASK_STACK (12 * 1024)
 /* JIT-mount upload limits */
 #define WIGLE_JIT_MAX_ENTRIES   32             /* max paths per scan */
 
 static volatile bool wigle_upload_in_progress = false;
 static wigle_test_callback_t wigle_test_cb = NULL;
+static wigle_test_callback_t wigle_manual_upload_cb = NULL;
+static wigle_test_callback_t wigle_stats_cb = NULL;
 static bool wigle_test_in_progress = false;
+static bool wigle_manual_upload_in_progress = false;
+static bool wigle_stats_in_progress = false;
 
 void wigle_set_test_callback(wigle_test_callback_t callback) {
     wigle_test_cb = callback;
 }
 
+void wigle_set_manual_upload_callback(wigle_test_callback_t callback) {
+    wigle_manual_upload_cb = callback;
+}
+
+void wigle_set_stats_callback(wigle_test_callback_t callback) {
+    wigle_stats_cb = callback;
+}
+
 bool wigle_is_test_in_progress(void) {
     return wigle_test_in_progress;
+}
+
+bool wigle_is_manual_upload_in_progress(void) {
+    return wigle_manual_upload_in_progress;
+}
+
+bool wigle_is_stats_in_progress(void) {
+    return wigle_stats_in_progress;
 }
 
 typedef struct {
@@ -72,7 +93,7 @@ void wigle_set_api_key(const char *key) {
     FSettings *s = &G_Settings;
     strncpy(s->wigle_api_key, key, sizeof(s->wigle_api_key) - 1);
     s->wigle_api_key[sizeof(s->wigle_api_key) - 1] = '\0';
-    settings_save(s);
+    settings_persist_setting(SETTING_WIGLE_API_KEY);
 }
 
 const char *wigle_get_api_key(void) {
@@ -96,6 +117,40 @@ static bool wigle_sta_has_ip(void) {
     if (!sta) return false;
     esp_netif_ip_info_t ip = {0};
     return (esp_netif_get_ip_info(sta, &ip) == ESP_OK && ip.ip.addr != 0);
+}
+
+static bool wigle_require_jit_mount(void) {
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    return (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0);
+#else
+    return false;
+#endif
+}
+
+static bool wigle_is_safe_csv_name(const char *name) {
+    if (!name || !name[0]) return false;
+    if (strlen(name) >= MAX_PORTAL_NAME) return false;
+    if (strchr(name, '/') || strchr(name, '\\')) return false;
+    if (strstr(name, "..")) return false;
+    size_t len = strlen(name);
+    if (len <= 4 || strcasecmp(name + len - 4, ".csv") != 0) return false;
+    return true;
+}
+
+static esp_err_t wigle_mount_if_needed(bool *did_mount, bool *display_was_suspended) {
+    if (did_mount) *did_mount = false;
+    if (display_was_suspended) *display_was_suspended = false;
+    if (sd_card_manager.is_initialized) return ESP_OK;
+    esp_err_t err = sd_card_mount_for_flush(display_was_suspended);
+    if (err != ESP_OK) return err;
+    if (did_mount) *did_mount = true;
+    return ESP_OK;
+}
+
+static void wigle_unmount_if_needed(bool did_mount, bool display_was_suspended) {
+    if (did_mount) {
+        sd_card_unmount_after_flush(display_was_suspended);
+    }
 }
 
 /* Check if file (basename,size) was already uploaded. File format: basename,size\n */
@@ -670,6 +725,80 @@ void wigle_queue_add(const char *filepath) {
     fclose(q);
 }
 
+int wigle_list_csv_files_paged(int offset, int max_count,
+                               char (*out_names)[MAX_PORTAL_NAME],
+                               bool *out_has_more) {
+    if (!out_names || max_count <= 0 || offset < 0) {
+        if (out_has_more) *out_has_more = false;
+        return -1;
+    }
+
+    bool did_mount = false;
+    bool dws = false;
+    esp_err_t err = wigle_mount_if_needed(&did_mount, &dws);
+    if (err != ESP_OK) {
+        if (out_has_more) *out_has_more = false;
+        return -1;
+    }
+
+    int count = sd_card_list_dir_paged("/mnt/ghostesp/gps", ".csv",
+                                       offset, max_count,
+                                       out_names, out_has_more);
+
+    wigle_unmount_if_needed(did_mount, dws);
+    return count;
+}
+
+esp_err_t wigle_get_csv_info(const char *filename, int *out_wifi_rows, int *out_total_rows) {
+    if (!wigle_is_safe_csv_name(filename)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    bool did_mount = false;
+    bool dws = false;
+    esp_err_t err = wigle_mount_if_needed(&did_mount, &dws);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    char path[320];
+    snprintf(path, sizeof(path), "/mnt/ghostesp/gps/%s", filename);
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        wigle_unmount_if_needed(did_mount, dws);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    if (!wigle_file_is_valid_format(f)) {
+        fclose(f);
+        wigle_unmount_if_needed(did_mount, dws);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    int wifi_rows = 0;
+    int total_rows = 0;
+    char line[512];
+    int line_num = 0;
+    fseek(f, 0, SEEK_SET);
+    while (fgets(line, sizeof(line), f)) {
+        line_num++;
+        if (line_num <= 2) continue; /* pre-header + csv header */
+        if (line[0] == '\r' || line[0] == '\n' || line[0] == '\0') continue;
+        total_rows++;
+        if (strstr(line, ",WIFI") != NULL) {
+            wifi_rows++;
+        }
+    }
+
+    fclose(f);
+    wigle_unmount_if_needed(did_mount, dws);
+
+    if (out_wifi_rows) *out_wifi_rows = wifi_rows;
+    if (out_total_rows) *out_total_rows = total_rows;
+    return ESP_OK;
+}
+
 /* Process queue file: upload queued files, remove successful ones from queue.
  * Reads queue line-by-line to avoid large buffers. Only files that fail to
  * upload are written back to the queue for retry. */
@@ -881,6 +1010,350 @@ void wigle_upload_all_async(void) {
 }
 
 #define WIGLE_PROFILE_URL "https://api.wigle.net/api/v2/profile/user"
+#define WIGLE_STATS_URL   "https://api.wigle.net/api/v2/stats/user"
+
+typedef struct {
+    char filename[MAX_PORTAL_NAME];
+} wigle_single_upload_arg_t;
+
+typedef struct {
+    char message[256];
+    bool success;
+} wigle_result_t;
+
+static esp_err_t wigle_build_auth_header(const char *api_key, char *auth_val, size_t auth_val_len) {
+    if (!api_key || !auth_val || auth_val_len == 0) return ESP_ERR_INVALID_ARG;
+
+    char auth_b64[AUTH_BUF_SIZE];
+    size_t enc_len = AUTH_BUF_SIZE - 1;
+    int r = mbedtls_base64_encode((unsigned char *)auth_b64, AUTH_BUF_SIZE, &enc_len,
+                                  (const unsigned char *)api_key, strlen(api_key));
+    if (r != 0) {
+        return ESP_FAIL;
+    }
+    auth_b64[enc_len] = '\0';
+    snprintf(auth_val, auth_val_len, "Basic %s", auth_b64);
+    return ESP_OK;
+}
+
+static esp_err_t wigle_validate_single_csv_mounted(const char *filename,
+                                                   char *path_out, size_t path_out_len,
+                                                   long *fsize_out,
+                                                   char *reason, size_t reason_len) {
+    if (reason && reason_len > 0) reason[0] = '\0';
+
+    if (!wigle_is_safe_csv_name(filename)) {
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "Invalid CSV filename");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    snprintf(path_out, path_out_len, "/mnt/ghostesp/gps/%s", filename);
+
+    struct stat st;
+    if (stat(path_out, &st) != 0) {
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "CSV not found: %s", filename);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    long fsize = (long)st.st_size;
+    if (fsize <= 0) {
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "CSV is empty: %s", filename);
+        return ESP_ERR_INVALID_SIZE;
+    }
+
+    if (wigle_uploaded_check(filename, fsize)) {
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "Already uploaded: %s", filename);
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    FILE *f = fopen(path_out, "rb");
+    if (!f) {
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "Cannot open CSV: %s", filename);
+        return ESP_FAIL;
+    }
+
+    if (!wigle_file_is_valid_format(f)) {
+        fclose(f);
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "Not a WiGLE CSV: %s", filename);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    fseek(f, 0, SEEK_SET);
+    if (!wigle_file_has_data_rows(f)) {
+        fclose(f);
+        if (reason && reason_len > 0) snprintf(reason, reason_len, "CSV has no data rows");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    fclose(f);
+    if (fsize_out) *fsize_out = fsize;
+    return ESP_OK;
+}
+
+esp_err_t wigle_upload_single_csv(const char *filename, char *message, size_t message_len) {
+    if (!message || message_len == 0) return ESP_ERR_INVALID_ARG;
+    message[0] = '\0';
+
+    const char *api_key = wigle_get_api_key();
+    if (!api_key || api_key[0] == '\0') {
+        snprintf(message, message_len, "No API key set");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (strchr(api_key, ':') == NULL) {
+        snprintf(message, message_len, "API key must be APIName:APIToken");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!wigle_sta_has_ip()) {
+        snprintf(message, message_len, "Connect to WiFi first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char path[320];
+    char reason[128];
+    long fsize = 0;
+    esp_err_t ret;
+
+    if (wigle_require_jit_mount()) {
+        bool dws = false;
+        if (sd_card_mount_for_flush(&dws) != ESP_OK) {
+            snprintf(message, message_len, "SD mount failed");
+            return ESP_FAIL;
+        }
+
+        ret = wigle_validate_single_csv_mounted(filename, path, sizeof(path), &fsize, reason, sizeof(reason));
+        sd_card_unmount_after_flush(dws);
+        if (ret != ESP_OK) {
+            snprintf(message, message_len, "%s", reason[0] ? reason : "CSV validation failed");
+            return ret;
+        }
+
+        ret = wigle_upload_file_jit(path, fsize, filename, api_key);
+        if (ret == ESP_OK) {
+            bool dws2 = false;
+            if (sd_card_mount_for_flush(&dws2) == ESP_OK) {
+                wigle_uploaded_add(filename, fsize);
+                sd_card_unmount_after_flush(dws2);
+            }
+            snprintf(message, message_len, "Uploaded %s", filename);
+            return ESP_OK;
+        }
+
+        snprintf(message, message_len, "Upload failed: %s", filename);
+        return ret;
+    }
+
+    bool did_mount = false;
+    bool dws = false;
+    ret = wigle_mount_if_needed(&did_mount, &dws);
+    if (ret != ESP_OK) {
+        snprintf(message, message_len, "SD mount failed");
+        return ret;
+    }
+
+    ret = wigle_validate_single_csv_mounted(filename, path, sizeof(path), &fsize, reason, sizeof(reason));
+    if (ret != ESP_OK) {
+        wigle_unmount_if_needed(did_mount, dws);
+        snprintf(message, message_len, "%s", reason[0] ? reason : "CSV validation failed");
+        return ret;
+    }
+
+    ret = wigle_upload_file(path, api_key);
+    wigle_unmount_if_needed(did_mount, dws);
+
+    if (ret == ESP_OK) {
+        snprintf(message, message_len, "Uploaded %s", filename);
+    } else {
+        snprintf(message, message_len, "Upload failed: %s", filename);
+    }
+    return ret;
+}
+
+static void wigle_single_upload_task(void *arg) {
+    wigle_single_upload_arg_t *task = (wigle_single_upload_arg_t *)arg;
+    wigle_result_t result = {0};
+
+    esp_err_t ret = wigle_upload_single_csv(task->filename, result.message, sizeof(result.message));
+    result.success = (ret == ESP_OK);
+
+    if (wigle_manual_upload_cb) {
+        wigle_manual_upload_cb(result.success, result.message[0] ? result.message :
+            (result.success ? "Upload completed" : "Upload failed"));
+    }
+
+    wigle_manual_upload_in_progress = false;
+    free(task);
+    vTaskDelete(NULL);
+}
+
+esp_err_t wigle_upload_single_csv_async(const char *filename) {
+    if (wigle_manual_upload_in_progress) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (!wigle_is_safe_csv_name(filename)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    wigle_single_upload_arg_t *task = calloc(1, sizeof(*task));
+    if (!task) return ESP_ERR_NO_MEM;
+    strncpy(task->filename, filename, sizeof(task->filename) - 1);
+    task->filename[sizeof(task->filename) - 1] = '\0';
+
+    wigle_manual_upload_in_progress = true;
+    if (xTaskCreate(wigle_single_upload_task, "wigle_up1", WIGLE_TASK_STACK, task, 5, NULL) != pdPASS) {
+        wigle_manual_upload_in_progress = false;
+        free(task);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+esp_err_t wigle_get_stats(char *message, size_t message_len) {
+    if (!message || message_len == 0) return ESP_ERR_INVALID_ARG;
+    message[0] = '\0';
+
+    const char *api_key = wigle_get_api_key();
+    if (!api_key || api_key[0] == '\0') {
+        snprintf(message, message_len, "No API key set");
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (strchr(api_key, ':') == NULL) {
+        snprintf(message, message_len, "API key must be APIName:APIToken");
+        return ESP_ERR_INVALID_ARG;
+    }
+    if (!wigle_sta_has_ip()) {
+        snprintf(message, message_len, "Connect to WiFi first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    char auth_val[6 + AUTH_BUF_SIZE + 1];
+    if (wigle_build_auth_header(api_key, auth_val, sizeof(auth_val)) != ESP_OK) {
+        snprintf(message, message_len, "API key encoding failed");
+        return ESP_FAIL;
+    }
+
+    wigle_resp_t resp = {0};
+    esp_http_client_config_t config = {
+        .url = WIGLE_STATS_URL,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 15000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .transport_type = HTTP_TRANSPORT_OVER_SSL,
+        .event_handler = wigle_http_event,
+        .user_data = &resp,
+        .buffer_size = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (!client) {
+        snprintf(message, message_len, "HTTP client init failed");
+        return ESP_FAIL;
+    }
+
+    esp_http_client_set_header(client, "Accept", "application/json");
+    esp_http_client_set_header(client, "User-Agent", "GhostESP/1.0");
+    esp_http_client_set_header(client, "Authorization", auth_val);
+
+    esp_err_t err = esp_http_client_perform(client);
+    int status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+
+    if (err != ESP_OK) {
+        snprintf(message, message_len, "Network error: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (status != 200) {
+        snprintf(message, message_len, "HTTP error: %d", status);
+        return ESP_FAIL;
+    }
+
+    cJSON *root = cJSON_Parse(resp.buf);
+    if (!root) {
+        snprintf(message, message_len, "Failed to parse stats response");
+        return ESP_FAIL;
+    }
+
+    const cJSON *success_json = cJSON_GetObjectItemCaseSensitive(root, "success");
+    if (cJSON_IsBool(success_json) && !cJSON_IsTrue(success_json)) {
+        const cJSON *msg_json = cJSON_GetObjectItemCaseSensitive(root, "message");
+        snprintf(message, message_len, "%s",
+                 cJSON_IsString(msg_json) ? msg_json->valuestring : "WiGLE stats request failed");
+        cJSON_Delete(root);
+        return ESP_FAIL;
+    }
+
+    cJSON *stats = cJSON_GetObjectItemCaseSensitive(root, "statistics");
+    if (!cJSON_IsObject(stats)) stats = root;
+
+    const cJSON *user_json = cJSON_GetObjectItemCaseSensitive(root, "user");
+    const cJSON *user_name_json = cJSON_GetObjectItemCaseSensitive(stats, "userName");
+    const char *user = cJSON_IsString(user_json) ? user_json->valuestring :
+                      (cJSON_IsString(user_name_json) ? user_name_json->valuestring : "(unknown)");
+
+    const cJSON *rank_json = cJSON_GetObjectItemCaseSensitive(root, "rank");
+    const cJSON *month_rank_json = cJSON_GetObjectItemCaseSensitive(root, "monthRank");
+    long long rank = cJSON_IsNumber(rank_json) ? (long long)rank_json->valuedouble :
+                     (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(stats, "rank")) ?
+                      (long long)cJSON_GetObjectItemCaseSensitive(stats, "rank")->valuedouble : 0);
+    long long month_rank = cJSON_IsNumber(month_rank_json) ? (long long)month_rank_json->valuedouble :
+                           (cJSON_IsNumber(cJSON_GetObjectItemCaseSensitive(stats, "monthRank")) ?
+                            (long long)cJSON_GetObjectItemCaseSensitive(stats, "monthRank")->valuedouble : 0);
+
+    const cJSON *wifi_json = cJSON_GetObjectItemCaseSensitive(stats, "discoveredWiFi");
+    const cJSON *wifi_gps_json = cJSON_GetObjectItemCaseSensitive(stats, "discoveredWiFiGPS");
+    const cJSON *cell_json = cJSON_GetObjectItemCaseSensitive(stats, "discoveredCell");
+    const cJSON *bt_json = cJSON_GetObjectItemCaseSensitive(stats, "discoveredBt");
+    const cJSON *total_loc_json = cJSON_GetObjectItemCaseSensitive(stats, "totalWiFiLocations");
+
+    long long wifi = cJSON_IsNumber(wifi_json) ? (long long)wifi_json->valuedouble : 0;
+    long long wifi_gps = cJSON_IsNumber(wifi_gps_json) ? (long long)wifi_gps_json->valuedouble : 0;
+    long long cell = cJSON_IsNumber(cell_json) ? (long long)cell_json->valuedouble : 0;
+    long long bt = cJSON_IsNumber(bt_json) ? (long long)bt_json->valuedouble : 0;
+    long long total_locs = cJSON_IsNumber(total_loc_json) ? (long long)total_loc_json->valuedouble : 0;
+
+    snprintf(message, message_len,
+             "User: %s\n"
+             "Global Rank: %lld\n"
+             "Monthly Rank: %lld\n"
+             "\n"
+             "Discoveries\n"
+             "WiFi Networks: %lld\n"
+             "WiFi with GPS: %lld\n"
+             "Cell Towers: %lld\n"
+             "Bluetooth: %lld\n"
+             "Total WiFi Locations: %lld",
+             user, rank, month_rank, wifi, wifi_gps, cell, bt, total_locs);
+
+    cJSON_Delete(root);
+    return ESP_OK;
+}
+
+static void wigle_stats_task(void *arg) {
+    (void)arg;
+    wigle_result_t result = {0};
+    esp_err_t ret = wigle_get_stats(result.message, sizeof(result.message));
+    result.success = (ret == ESP_OK);
+
+    if (wigle_stats_cb) {
+        wigle_stats_cb(result.success, result.message[0] ? result.message :
+            (result.success ? "Stats loaded" : "Failed to load stats"));
+    }
+
+    wigle_stats_in_progress = false;
+    vTaskDelete(NULL);
+}
+
+esp_err_t wigle_get_stats_async(void) {
+    if (wigle_stats_in_progress) {
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    wigle_stats_in_progress = true;
+    if (xTaskCreate(wigle_stats_task, "wigle_stats", WIGLE_TASK_STACK, NULL, 5, NULL) != pdPASS) {
+        wigle_stats_in_progress = false;
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
 
 typedef struct {
     char message[128];

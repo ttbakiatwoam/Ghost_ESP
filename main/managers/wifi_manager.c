@@ -49,6 +49,7 @@
 #include "core/utils.h" // Add utils include
 #include <inttypes.h>
 #include "managers/default_portal.h"
+#include "core/commandline.h"
 #include "freertos/task.h"
 #include "freertos/portmacro.h"
 #include "mbedtls/ecp.h"
@@ -119,6 +120,9 @@ const char *TAG = "WiFiManager";
 // Station scan variables moved to station_scan.c module
 bool manual_disconnect = false;
 static bool boot_connection_attempted = false;
+static volatile bool wifi_connect_cancel_requested = false;
+static volatile bool visualizer_stop_requested = false;
+static volatile int visualizer_socket = -1;
 
 static bool karma_portal_active = false;
 
@@ -155,6 +159,20 @@ static bool use_html_buffer = false;
 // jit sd mount state for portal (somethingsomething template)
 static bool portal_sd_jit_mounted = false;
 static bool portal_display_suspended = false;
+
+// Pre-loaded portal file cache for somethingsomething (JIT SPI-shared SD) builds.
+// The file is read once during portal startup while the SD is mounted in the
+// command-task context, avoiding a cross-task SPI bus re-init on every HTTP request.
+static char  *portal_file_cache      = NULL;
+static size_t portal_file_cache_size = 0;
+
+static void portal_clear_file_cache(void) {
+    if (portal_file_cache != NULL) {
+        free(portal_file_cache);
+        portal_file_cache = NULL;
+    }
+    portal_file_cache_size = 0;
+}
 
 #define PORTAL_KEYSTROKE_BUF_SZ 512
 #define PORTAL_CREDS_BUF_SZ 384
@@ -424,6 +442,23 @@ struct DeviceInfo {
 
 void wifi_manager_set_manual_disconnect(bool disconnect) {
     manual_disconnect = disconnect;
+}
+
+void wifi_manager_cancel_connect(void) {
+    wifi_connect_cancel_requested = true;
+    manual_disconnect = true;
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_STARTED && err != ESP_ERR_WIFI_NOT_CONNECT) {
+        ESP_LOGW(TAG, "cancel_connect: esp_wifi_disconnect returned %s", esp_err_to_name(err));
+    }
+}
+
+void wifi_manager_stop_visualizer(void) {
+    visualizer_stop_requested = true;
+
+    if (visualizer_socket >= 0) {
+        shutdown(visualizer_socket, 0);
+    }
 }
 
 static void tolower_str(const uint8_t *src, char *dst) {
@@ -838,6 +873,20 @@ esp_err_t portal_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
+    // Serve from pre-loaded portal file cache (JIT SD-mount builds: somethingsomething).
+    // This avoids re-mounting the SD from the HTTP server task where SPI bus contention
+    // with the display causes the mount to fail and returns an error page to the client.
+    if (portal_file_cache != NULL && portal_file_cache_size > 0) {
+        ESP_LOGI(TAG, "Using pre-loaded portal file cache (%zu bytes)", portal_file_cache_size);
+        httpd_resp_set_type(req, "text/html");
+        httpd_resp_set_hdr(req, "Transfer-Encoding", "chunked");
+        httpd_resp_send_chunk(req, portal_file_cache, portal_file_cache_size);
+        httpd_resp_send_chunk(req, CAPTURE_JS_SNIPPET, strlen(CAPTURE_JS_SNIPPET));
+        httpd_resp_send_chunk(req, NULL, 0);
+        ESP_LOGI(TAG, "Served portal from file cache with JS injection.");
+        return ESP_OK;
+    }
+
     // Check if we should serve the default embedded portal
     if (strcmp(PORTALURL, "INTERNAL_DEFAULT_PORTAL") == 0) {
         httpd_resp_set_type(req, "text/html");
@@ -850,8 +899,22 @@ esp_err_t portal_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    // Otherwise, proceed with streaming from URL or file
+    // Otherwise, proceed with streaming from URL or file.
+    // JIT mount SD for somethingsomething template (SPI bus shared with display).
+    // file_handler() uses the same pattern for portal asset files.
+    bool portal_jit_display_suspended = false;
+    bool portal_jit_did_mount = false;
+    bool portal_is_local_file = (strncmp(PORTALURL, "http://", 7) != 0 &&
+                                 strncmp(PORTALURL, "https://", 8) != 0);
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0) {
+        if (portal_is_local_file && !sd_card_manager.is_initialized) {
+            portal_jit_did_mount = (sd_card_mount_for_flush(&portal_jit_display_suspended) == ESP_OK);
+        }
+    }
+#endif
     esp_err_t err = stream_data_to_client(req, PORTALURL, "text/html");
+    if (portal_jit_did_mount) sd_card_unmount_after_flush(portal_jit_display_suspended);
 
     if (err != ESP_OK) {
         const char *err_msg = esp_err_to_name(err);
@@ -1296,7 +1359,48 @@ esp_err_t wifi_manager_start_evil_portal(const char *URLorFilePath, const char *
         }
     }
 
-    // Unmount SD after filename generation to free SPI bus for display/WiFi operations
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+    // For JIT-mount builds (somethingsomething): while the SD card is still mounted,
+    // pre-load the custom portal HTML file into a heap buffer so that portal_handler()
+    // can serve it without needing to re-mount the SD from the HTTP server task context
+    // (which races with the display SPI bus and causes the mount to fail).
+    if (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0) {
+        portal_clear_file_cache();  // discard any leftover cache from a previous portal run
+        bool is_local = (URLorFilePath != NULL &&
+                         strncmp(URLorFilePath, "http://", 7) != 0 &&
+                         strncmp(URLorFilePath, "https://", 8) != 0 &&
+                         strcmp(URLorFilePath, "default") != 0);
+        if (is_local && sd_card_manager.is_initialized) {
+            FILE *pf = fopen(URLorFilePath, "r");
+            if (pf != NULL) {
+                fseek(pf, 0, SEEK_END);
+                long pf_size = ftell(pf);
+                rewind(pf);
+                if (pf_size > 0) {
+                    char *pf_buf = malloc((size_t)pf_size + 1);
+                    if (pf_buf != NULL) {
+                        size_t pf_read = fread(pf_buf, 1, (size_t)pf_size, pf);
+                        pf_buf[pf_read] = '\0';
+                        portal_file_cache      = pf_buf;
+                        portal_file_cache_size = pf_read;
+                        ESP_LOGI(TAG, "Portal file pre-loaded into cache: %zu bytes from %s",
+                                 pf_read, URLorFilePath);
+                    } else {
+                        ESP_LOGW(TAG, "Portal file cache: malloc failed for %ld bytes", pf_size);
+                    }
+                } else {
+                    ESP_LOGW(TAG, "Portal file cache: fseek/ftell returned %ld for %s", pf_size, URLorFilePath);
+                }
+                fclose(pf);
+            } else {
+                ESP_LOGW(TAG, "Portal file cache: cannot open %s for pre-load", URLorFilePath);
+            }
+        }
+    }
+#endif
+
+    // Unmount SD after filename generation (and portal file pre-load) to free SPI bus
+    // for display/WiFi operations.
     if (portal_sd_jit_mounted) {
         sd_card_unmount_after_flush(portal_display_suspended);
         // Reset flags since we've unmounted - handlers will JIT mount on demand
@@ -1363,9 +1467,22 @@ esp_err_t wifi_manager_start_evil_portal(const char *URLorFilePath, const char *
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_AP));
     esp_wifi_set_ps(WIFI_PS_NONE);
 
-    // be conservative for client compatibility (esp32-c5 can do more, but this avoids weird auth edge cases)
+    // be conservative for client compatibility (2.4GHz only, HT20 for max compatibility)
+#if defined(CONFIG_IDF_TARGET_ESP32C5) || defined(CONFIG_IDF_TARGET_ESP32C6)
+    {
+        // Dual-band chips in WIFI_BAND_MODE_AUTO require the plural APIs
+        wifi_bandwidths_t bws = { .ghz_2g = WIFI_BW_HT20, .ghz_5g = WIFI_BW_HT20 };
+        (void)esp_wifi_set_bandwidths(WIFI_IF_AP, &bws);
+        wifi_protocols_t p = {
+            .ghz_2g = WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N,
+            .ghz_5g = WIFI_PROTOCOL_11A | WIFI_PROTOCOL_11N,
+        };
+        (void)esp_wifi_set_protocols(WIFI_IF_AP, &p);
+    }
+#else
     (void)esp_wifi_set_bandwidth(WIFI_IF_AP, WIFI_BW_HT20);
     (void)esp_wifi_set_protocol(WIFI_IF_AP, WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N);
+#endif
     dnsserver.ip.u_addr.ip4.addr = esp_ip4addr_aton("192.168.4.1");
     dnsserver.ip.type = ESP_IPADDR_TYPE_V4;
     ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_AP, &ap_config));
@@ -1429,6 +1546,8 @@ void wifi_manager_stop_evil_portal() {
     
     // Free captured HTML buffer when portal stops to reclaim RAM
     wifi_manager_clear_html_buffer();
+    // Free pre-loaded portal file cache (JIT SD-mount builds)
+    portal_clear_file_cache();
 
     if (dns_handle != NULL) {
         stop_dns_server(dns_handle);
@@ -1951,6 +2070,7 @@ void wifi_manager_deauth_station(void) {
 #define NUM_BARS 15
 
 void screen_music_visualizer_task(void *pvParameters) {
+    (void)pvParameters;
     char rx_buffer[128];
     char track_name[TRACK_NAME_LEN + 1];
     char artist_name[ARTIST_NAME_LEN + 1];
@@ -1961,12 +2081,16 @@ void screen_music_visualizer_task(void *pvParameters) {
     dest_addr.sin_port = htons(UDP_PORT);
     dest_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
+    visualizer_stop_requested = false;
+
     int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (sock < 0) {
         printf("Unable to create socket: errno %d\n", errno);
+        VisualizerHandle = NULL;
         vTaskDelete(NULL);
-        return;
     }
+
+    visualizer_socket = sock;
 
     printf("Socket created\n");
 
@@ -1974,13 +2098,14 @@ void screen_music_visualizer_task(void *pvParameters) {
     if (err < 0) {
         printf("Socket unable to bind: errno %d\n", errno);
         close(sock);
+        visualizer_socket = -1;
+        VisualizerHandle = NULL;
         vTaskDelete(NULL);
-        return;
     }
 
     printf("Socket bound, port %d\n", UDP_PORT);
 
-    while (1) {
+    while (!visualizer_stop_requested) {
         printf("Waiting for data...\n");
 
         struct sockaddr_in6 source_addr;
@@ -1989,6 +2114,9 @@ void screen_music_visualizer_task(void *pvParameters) {
         int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0,
                            (struct sockaddr *)&source_addr, &socklen);
         if (len < 0) {
+            if (visualizer_stop_requested) {
+                break;
+            }
             printf("recvfrom failed: errno %d\n", errno);
             break;
         }
@@ -2019,9 +2147,13 @@ void screen_music_visualizer_task(void *pvParameters) {
         close(sock);
     }
 
+    visualizer_socket = -1;
+    visualizer_stop_requested = false;
+    VisualizerHandle = NULL;
     vTaskDelete(NULL);
 }
 void animate_led_based_on_amplitude(void *pvParameters) {
+    (void)pvParameters;
     char rx_buffer[128];
     char addr_str[128];
     int addr_family = AF_INET;
@@ -2032,17 +2164,23 @@ void animate_led_based_on_amplitude(void *pvParameters) {
     dest_addr.sin_family = addr_family;
     dest_addr.sin_port = htons(UDP_PORT);
 
+    visualizer_stop_requested = false;
+
     int sock = socket(addr_family, SOCK_DGRAM, ip_protocol);
     if (sock < 0) {
         printf("Unable to create socket: errno %d\n", errno);
-        return;
+        VisualizerHandle = NULL;
+        vTaskDelete(NULL);
     }
+    visualizer_socket = sock;
     printf("Socket created\n");
 
     if (bind(sock, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) < 0) {
         printf("Socket unable to bind: errno %d\n", errno);
         close(sock);
-        return;
+        visualizer_socket = -1;
+        VisualizerHandle = NULL;
+        vTaskDelete(NULL);
     }
     printf("Socket bound, port %d\n", UDP_PORT);
 
@@ -2054,7 +2192,7 @@ void animate_led_based_on_amplitude(void *pvParameters) {
     uint32_t last_error_time = 0;
     const uint32_t error_rate_limit_ms = 5000;
 
-    while (1) {
+    while (!visualizer_stop_requested) {
         struct sockaddr_in source_addr;
         socklen_t socklen = sizeof(source_addr);
         int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, MSG_DONTWAIT,
@@ -2144,6 +2282,11 @@ void animate_led_based_on_amplitude(void *pvParameters) {
         shutdown(sock, 0);
         close(sock);
     }
+
+    visualizer_socket = -1;
+    visualizer_stop_requested = false;
+    VisualizerHandle = NULL;
+    vTaskDelete(NULL);
 }
 
 #define START_HOST 1
@@ -2789,9 +2932,35 @@ void wifi_manager_start_ip_lookup() {
     TERMINAL_VIEW_ADD_TEXT("IP Scan Done...\n");
 }
 void wifi_manager_connect_wifi(const char *ssid, const char *password) {
+    if (ssid == NULL || ssid[0] == '\0') {
+        printf("No SSID provided\n");
+        TERMINAL_VIEW_ADD_TEXT("No SSID provided\n");
+        status_display_show_status("WiFi No SSID");
+        return;
+    }
+
+    if (!wifi_ctrl_lock(pdMS_TO_TICKS(2000))) {
+        ESP_LOGE(TAG, "connect: wifi ctrl mutex lock failed");
+        TERMINAL_VIEW_ADD_TEXT("WiFi busy, try again\n");
+        status_display_show_status("WiFi Busy");
+        return;
+    }
+
     printf("Connecting to WiFi: %s\n", ssid);
     TERMINAL_VIEW_ADD_TEXT("Connecting to WiFi: %s\n", ssid);
     status_display_show_status("WiFi Connecting...");
+    wifi_connect_cancel_requested = false;
+
+    wifi_ap_record_t current_ap = {0};
+    if (esp_wifi_sta_get_ap_info(&current_ap) == ESP_OK &&
+        strncmp((const char *)current_ap.ssid, ssid, sizeof(current_ap.ssid)) == 0) {
+        printf("Already connected to %s\n", ssid);
+        TERMINAL_VIEW_ADD_TEXT("Already connected to %s\n", ssid);
+        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
+        status_display_show_status("WiFi Connected");
+        wifi_ctrl_unlock();
+        return;
+    }
     
     wifi_config_t wifi_config = {0};
     
@@ -2817,24 +2986,57 @@ void wifi_manager_connect_wifi(const char *ssid, const char *password) {
     
     // Set the connecting bit BEFORE any WiFi operations
     xEventGroupSetBits(wifi_event_group, WIFI_CONNECTING_BIT);
-    
-    // Stop WiFi completely to ensure clean state
-    esp_wifi_stop();
-    vTaskDelay(pdMS_TO_TICKS(100));
-    
-    // Reconfigure and restart WiFi
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_APSTA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
-    ESP_ERROR_CHECK(esp_wifi_start());
-    
-    // Wait for WiFi to be ready
-    vTaskDelay(pdMS_TO_TICKS(1000));
+
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_APSTA);
+    if (err != ESP_OK) {
+        printf("Failed to set WiFi mode: %s\n", esp_err_to_name(err));
+        TERMINAL_VIEW_ADD_TEXT("Failed to set WiFi mode\n");
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTING_BIT);
+        status_display_show_status("WiFi Mode Fail");
+        wifi_ctrl_unlock();
+        return;
+    }
+
+    err = esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
+    if (err != ESP_OK) {
+        printf("Failed to configure STA: %s\n", esp_err_to_name(err));
+        TERMINAL_VIEW_ADD_TEXT("Failed to configure WiFi\n");
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTING_BIT);
+        status_display_show_status("WiFi Config Fail");
+        wifi_ctrl_unlock();
+        return;
+    }
+
+    err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT && err != ESP_ERR_WIFI_CONN) {
+        ESP_LOGW(TAG, "connect: esp_wifi_disconnect returned %s", esp_err_to_name(err));
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_CONN) {
+        printf("Failed to start WiFi: %s\n", esp_err_to_name(err));
+        TERMINAL_VIEW_ADD_TEXT("Failed to start WiFi\n");
+        xEventGroupClearBits(wifi_event_group, WIFI_CONNECTING_BIT);
+        status_display_show_status("WiFi Start Fail");
+        wifi_ctrl_unlock();
+        return;
+    }
+
+    wifi_ctrl_unlock();
+
+    vTaskDelay(pdMS_TO_TICKS(150));
 
     int retry_count = 0;
     const int max_retries = 5;  // Reduced retry count for cleaner logs
     bool connected = false;
 
     while (retry_count < max_retries && !connected) {
+        if (wifi_connect_cancel_requested) {
+            TERMINAL_VIEW_ADD_TEXT("WiFi connection cancelled\n");
+            printf("WiFi connection cancelled\n");
+            break;
+        }
+
         if (retry_count > 0) {
             printf("Retry attempt %d/%d...\n", retry_count, max_retries);
             TERMINAL_VIEW_ADD_TEXT("Retry attempt %d/%d...\n", retry_count, max_retries);
@@ -2843,12 +3045,40 @@ void wifi_manager_connect_wifi(const char *ssid, const char *password) {
         esp_err_t ret = esp_wifi_connect();
         if (ret == ESP_ERR_WIFI_CONN) {
             ret = ESP_OK; // Already connecting, handled elsewhere
+        } else if (ret == ESP_ERR_WIFI_NOT_STARTED) {
+            esp_err_t start_err = esp_wifi_start();
+            if (start_err == ESP_OK || start_err == ESP_ERR_WIFI_CONN) {
+                vTaskDelay(pdMS_TO_TICKS(150));
+                ret = esp_wifi_connect();
+                if (ret == ESP_ERR_WIFI_CONN) {
+                    ret = ESP_OK;
+                }
+            }
         }
 
         if (ret == ESP_OK) {
-            // Wait for connection with timeout
-            EventBits_t bits = xEventGroupWaitBits(wifi_event_group, 
-                WIFI_CONNECTED_BIT, pdFALSE, pdTRUE, pdMS_TO_TICKS(10000));
+            EventBits_t bits = 0;
+            const TickType_t wait_slice = pdMS_TO_TICKS(250);
+            const TickType_t wait_total = pdMS_TO_TICKS(10000);
+            TickType_t waited = 0;
+
+            while (!wifi_connect_cancel_requested && waited < wait_total) {
+                bits = xEventGroupWaitBits(wifi_event_group,
+                                           WIFI_CONNECTED_BIT,
+                                           pdFALSE,
+                                           pdTRUE,
+                                           wait_slice);
+                if (bits & WIFI_CONNECTED_BIT) {
+                    break;
+                }
+                waited += wait_slice;
+            }
+
+            if (wifi_connect_cancel_requested) {
+                TERMINAL_VIEW_ADD_TEXT("WiFi connection cancelled\n");
+                printf("WiFi connection cancelled\n");
+                break;
+            }
             
             if (bits & WIFI_CONNECTED_BIT) {
                 connected = true;
@@ -2873,11 +3103,13 @@ void wifi_manager_connect_wifi(const char *ssid, const char *password) {
     // Clear the connecting bit as we're done with the manual connection attempt
     xEventGroupClearBits(wifi_event_group, WIFI_CONNECTING_BIT);
 
-    if (!connected) {
+    if (!connected && !wifi_connect_cancel_requested) {
         TERMINAL_VIEW_ADD_TEXT("Failed to connect to %s after %d attempts\n", ssid, max_retries);
         printf("Failed to connect to %s after %d attempts\n", ssid, max_retries);
         esp_wifi_disconnect();
     }
+
+    wifi_connect_cancel_requested = false;
 }
 
 // Beacon spam start function - wrapper for beacon_spam module
@@ -2891,10 +3123,19 @@ void wifi_manager_get_scan_results_data(uint16_t *count, wifi_ap_record_t **aps)
     *aps = scanned_aps;
 }
 
-void wifi_manager_start_scan_with_time(int seconds) {
+esp_err_t wifi_manager_start_scan_with_time(int seconds) {
     ap_manager_stop_services();
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_start());
+    esp_err_t err = esp_wifi_set_mode(WIFI_MODE_STA);
+    if (err != ESP_OK) {
+        printf("Failed to set WiFi mode for timed scan: %s\n", esp_err_to_name(err));
+        return err;
+    }
+
+    err = esp_wifi_start();
+    if (err != ESP_OK) {
+        printf("Failed to start WiFi for timed scan: %s\n", esp_err_to_name(err));
+        return err;
+    }
 
     wifi_scan_config_t scan_config = {
         .ssid = NULL,
@@ -2908,23 +3149,25 @@ void wifi_manager_start_scan_with_time(int seconds) {
     printf("WiFi Scan started\n");
     printf("Please wait %d Seconds...\n", seconds);
     TERMINAL_VIEW_ADD_TEXT("WiFi Scan started\n");
-    {
-        char buf[64]; snprintf(buf, sizeof(buf), "Please wait %d Seconds...\n", seconds);
-        TERMINAL_VIEW_ADD_TEXT(buf);
-    }
+    TERMINAL_VIEW_ADD_TEXT("Please wait %d Seconds...\n", seconds);
 
-    esp_err_t err = esp_wifi_scan_start(&scan_config, false);
+    err = esp_wifi_scan_start(&scan_config, false);
     if (err != ESP_OK) {
         printf("WiFi scan failed to start: %s\n", esp_err_to_name(err));
         TERMINAL_VIEW_ADD_TEXT("WiFi scan failed to start\n");
-        return;
+        return err;
     }
 
     vTaskDelay(pdMS_TO_TICKS(seconds * 1000));
 
     wifi_manager_stop_scan();
-    ESP_ERROR_CHECK(esp_wifi_stop());
+    err = esp_wifi_stop();
+    if (err != ESP_OK) {
+        printf("Failed to stop WiFi after timed scan: %s\n", esp_err_to_name(err));
+        return err;
+    }
     // ESP_ERROR_CHECK(ap_manager_start_services()); // Removed: Rely on caller (handle_combined_scan) to restart AP services
+    return ESP_OK;
 }
 
 // Station scan channel hopping functions moved to station_scan.c module
@@ -3263,6 +3506,7 @@ static int karma_ssid_count = 0;
 static int karma_ssid_index = 0;
 static uint32_t last_ssid_change_time = 0;
 static bool karma_ssid_manual_mode = false;
+static char karma_portal_file[256] = "default";
 
 
 // Helper to add SSID to cache if not present
@@ -3294,6 +3538,15 @@ void wifi_manager_set_karma_ssid_list(const char **ssids, int count) {
     }
     karma_ssid_index = 0;
     karma_ssid_manual_mode = true;
+}
+
+void wifi_manager_set_karma_portal_file(const char *path) {
+    if (path && strlen(path) < sizeof(karma_portal_file)) {
+        strncpy(karma_portal_file, path, sizeof(karma_portal_file) - 1);
+        karma_portal_file[sizeof(karma_portal_file) - 1] = '\0';
+    } else {
+        strncpy(karma_portal_file, "default", sizeof(karma_portal_file));
+    }
 }
 
 // Helper function to send a probe response to a station
@@ -3383,9 +3636,9 @@ static void karma_probe_request_callback(void *buf, wifi_promiscuous_pkt_type_t 
 }
 
 static void karma_start_portal_for_ssid(const char *ssid) {
-    // Use the default portal, SSID as AP name, open AP (no password)
+    // Use the configured portal file (default or custom from SD), SSID as AP name, open AP
     if (!karma_portal_active) {
-        wifi_manager_start_evil_portal("default", ssid, "", ssid, "portal.local");
+        wifi_manager_start_evil_portal(karma_portal_file, ssid, "", ssid, "portal.local");
         karma_portal_active = true;
         printf("[KARMA] Evil portal started for SSID: %s\n", ssid);
         TERMINAL_VIEW_ADD_TEXT("[KARMA] Evil portal started for SSID: %s\n", ssid);
@@ -3478,12 +3731,18 @@ void wifi_manager_start_karma(void) {
         TERMINAL_VIEW_ADD_TEXT("Karma attack already running\n");
         return;
     }
-    karma_running = true;
     if (!karma_ssid_manual_mode) {
         karma_ssid_count = 0;
         karma_ssid_index = 0;
     }
-    xTaskCreate(karma_task, "karma_task", 4096, NULL, 5, &karma_task_handle);
+    BaseType_t rc = xTaskCreate(karma_task, "karma_task", 4096, NULL, 5, &karma_task_handle);
+    if (rc != pdPASS) {
+        printf("Failed to start Karma task (%ld)\n", (long)rc);
+        TERMINAL_VIEW_ADD_TEXT("Failed to start Karma task\n");
+        karma_task_handle = NULL;
+        return;
+    }
+    karma_running = true;
 }
 
 void wifi_manager_stop_karma(void) {
@@ -3496,7 +3755,16 @@ void wifi_manager_stop_karma(void) {
     karma_ssid_count = 0;
     karma_ssid_index = 0;
     karma_ssid_manual_mode = false;
-    // Task will clean up itself
+    strncpy(karma_portal_file, "default", sizeof(karma_portal_file));
+    int wait_count = 0;
+    while (karma_task_handle != NULL && wait_count < 30) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        wait_count++;
+    }
+    if (karma_task_handle != NULL) {
+        vTaskDelete(karma_task_handle);
+        karma_task_handle = NULL;
+    }
 }
 
 // rssi tracking for selected ap and sta

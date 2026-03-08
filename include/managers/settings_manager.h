@@ -82,10 +82,13 @@ typedef enum {
     SETTING_I2C_SCAN,
     SETTING_FACTORY_RESET,
     SETTING_SETUP_COMPLETE,
+    SETTING_WIGLE_API_KEY,
     SETTING_WIGLE_AUTO_UPLOAD,
     SETTING_WIGLE_DONATE,
     SETTING_WIGLE_TEST_API,
     SETTING_WIGLE_HELP,
+    SETTING_WIGLE_MANUAL_UPLOAD,
+    SETTING_WIGLE_STATS,
 #if defined(CONFIG_HAS_BADUSB) || defined(CONFIG_HAS_BADUSB_REMOTE)
     SETTING_BADUSB_VID,
     SETTING_BADUSB_PID,
@@ -205,6 +208,10 @@ typedef struct {
   char wigle_api_key[129];
   bool wigle_auto_upload; // Auto-upload CSVs at boot when WiFi connected
   bool wigle_donate; // Whether to donate uploads to Wigle
+  // IO expander programmable buttons (P10, P11, P12) - command to run when pressed, empty = send as joystick
+  char io_btn_p10_cmd[129];
+  char io_btn_p11_cmd[129];
+  char io_btn_p12_cmd[129];
 #if defined(CONFIG_HAS_BADUSB) || defined(CONFIG_HAS_BADUSB_REMOTE)
   uint16_t badusb_vid;
   uint16_t badusb_pid;
@@ -399,6 +406,14 @@ IdleAnimation settings_get_status_idle_animation(const FSettings *settings);
 void settings_set_status_idle_timeout_ms(FSettings *settings, uint32_t timeout_ms);
 uint32_t settings_get_status_idle_timeout_ms(const FSettings *settings);
 #endif
+
+// IO expander programmable buttons (P10, P11, P12)
+const char *settings_get_io_btn_p10_cmd(const FSettings *settings);
+void settings_set_io_btn_p10_cmd(FSettings *settings, const char *cmd);
+const char *settings_get_io_btn_p11_cmd(const FSettings *settings);
+void settings_set_io_btn_p11_cmd(FSettings *settings, const char *cmd);
+const char *settings_get_io_btn_p12_cmd(const FSettings *settings);
+void settings_set_io_btn_p12_cmd(FSettings *settings, const char *cmd);
 
 // BadUSB emulation settings
 #if defined(CONFIG_HAS_BADUSB) || defined(CONFIG_HAS_BADUSB_REMOTE)

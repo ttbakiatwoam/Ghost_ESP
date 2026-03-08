@@ -96,8 +96,15 @@ void* esp_netif_get_netif_impl(esp_netif_t *esp_netif);
 #include "freertos/queue.h"
 #include "managers/usb_keyboard_manager.h"
 #include "mbedtls/base64.h"
+#include "esp_partition.h"
+#include "esp_core_dump.h"
 #include "managers/aerial_detector_manager.h"
 #include "managers/wigle_manager.h"
+#include "managers/nrf24_remote_manager.h"
+
+#if defined(CONFIG_WITH_SCREEN) && (defined(CONFIG_HAS_NRF24) || defined(CONFIG_HAS_NRF24_REMOTE))
+#include "managers/views/nrf24_analyzer_view.h"
+#endif
 
 #include "attacks/wifi/dhcp_starvation.h"
 static const char *TAG = "Commandline";
@@ -156,6 +163,8 @@ void handle_aerial_stop_cmd(int argc, char **argv);
 void handle_aerial_spoof_cmd(int argc, char **argv);
 void handle_aerial_spoof_stop_cmd(int argc, char **argv);
 void handle_wigle_cmd(int argc, char **argv);
+void handle_loadconfig_cmd(int argc, char **argv);
+void handle_nrf24_cmd(int argc, char **argv);
 
 #define MAX_PORTAL_PATH_LEN 128 // reasonable i guess?
 
@@ -204,9 +213,15 @@ void register_command(const char *name, CommandFunction function) {
     Command *new_command = (Command *)malloc(sizeof(Command));
     if (new_command == NULL) {
         // Handle memory allocation failure
+        glog("Failed to register command '%s': out of memory\n", name);
         return;
     }
     new_command->name = strdup(name);
+    if (new_command->name == NULL) {
+        glog("Failed to register command '%s': out of memory\n", name);
+        free(new_command);
+        return;
+    }
     new_command->function = function;
     new_command->next = command_list_head;
     command_list_head = new_command;
@@ -249,6 +264,7 @@ void handle_unknown_command(const char *cmd) {
 }
 
 void cmd_wifi_scan_start(int argc, char **argv) {
+    esp_err_t timed_scan_err = ESP_OK;
     if (argc > 1) {
         if (strcmp(argv[1], "-stop") == 0) {
             cmd_wifi_scan_stop(argc, argv);
@@ -259,13 +275,27 @@ void cmd_wifi_scan_start(int argc, char **argv) {
             wifi_manager_start_live_ap_scan();
             return;
         }
-        int seconds = atoi(argv[1]);
-        wifi_manager_start_scan_with_time(seconds);
+        char *endptr = NULL;
+        long seconds_long = strtol(argv[1], &endptr, 10);
+        if (endptr == argv[1] || *endptr != '\0') {
+            glog("Invalid scan duration '%s'. Use an integer number of seconds.\n", argv[1]);
+            return;
+        }
+        if (seconds_long < 1 || seconds_long > 120) {
+            glog("Scan duration out of range (%ld). Valid range is 1-120 seconds.\n", seconds_long);
+            return;
+        }
+        timed_scan_err = wifi_manager_start_scan_with_time((int)seconds_long);
+        if (timed_scan_err != ESP_OK) {
+            glog("WiFi timed scan failed: %s\n", esp_err_to_name(timed_scan_err));
+            status_display_show_status("Scan Failed");
+            return;
+        }
     } else {
         wifi_manager_start_scan();
     }
     wifi_manager_print_scan_results_with_oui();
-    status_display_show_status("Scan Started");
+    status_display_show_status("Scan Complete");
 }
 
 void cmd_wifi_scan_stop(int argc, char **argv) {
@@ -279,8 +309,15 @@ void cmd_wifi_scan_stop(int argc, char **argv) {
     pcap_file_close();
 
     // Reset WiFi to a good state
-    esp_wifi_stop();
-    esp_wifi_start();
+    esp_err_t stop_err = esp_wifi_stop();
+    esp_err_t start_err = esp_wifi_start();
+
+    if (stop_err != ESP_OK || start_err != ESP_OK) {
+        glog("WiFi scan stop completed with recovery errors (stop=%s, start=%s).\n",
+             esp_err_to_name(stop_err), esp_err_to_name(start_err));
+        status_display_show_status("Scan Stop Warn");
+        return;
+    }
 
     glog("WiFi scan stopped.\n");
     status_display_show_status("Scan Stopped");
@@ -360,6 +397,9 @@ static const SettingDescriptor k_settings_desc[] = {
     {"flappy_name", ST_STRING, OFF(flappy_ghost_name), "Custom", 65, 0, 0},
     {"timezone", ST_STRING, OFF(selected_timezone), "Custom", 25, 0, 0},
     {"accent_color", ST_STRING, OFF(selected_hex_accent_color), "Custom", 25, 0, 0},
+    {"io_btn_p10_cmd", ST_STRING, OFF(io_btn_p10_cmd), "IO Button", 129, 0, 0},
+    {"io_btn_p11_cmd", ST_STRING, OFF(io_btn_p11_cmd), "IO Button", 129, 0, 0},
+    {"io_btn_p12_cmd", ST_STRING, OFF(io_btn_p12_cmd), "IO Button", 129, 0, 0},
 };
 
 static const SettingDescriptor *find_setting_desc(const char *name) {
@@ -679,7 +719,7 @@ void handle_select_cmd(int argc, char **argv) {
             if (*endptr == '\0') {
                 wifi_manager_select_ap(num);
             } else {
-                glog("Error: is not a valid number.\n");
+                glog("Error: '%s' is not a valid number.\n", input);
             }
         } else {
             int indices[32];
@@ -697,6 +737,11 @@ void handle_select_cmd(int argc, char **argv) {
                 }
                 token = strtok(NULL, ",");
             }
+
+            if (token != NULL) {
+                glog("Error: too many indices (max 32).\n");
+                return;
+            }
             
             if (count > 0) {
                 wifi_manager_select_multiple_aps(indices, count);
@@ -710,7 +755,7 @@ void handle_select_cmd(int argc, char **argv) {
         if (*endptr == '\0') {
             wifi_manager_select_station(num);
         } else {
-            glog("Error: is not a valid number.\n");
+            glog("Error: '%s' is not a valid number.\n", argv[2]);
         }
 #ifndef CONFIG_IDF_TARGET_ESP32S2
     } else if (strcmp(argv[1], "-airtag") == 0) {
@@ -754,6 +799,9 @@ static volatile bool g_ir_universal_send_cancel = false;
 
 static TaskHandle_t g_ir_rx_learn_task = NULL;
 
+void wifi_manager_cancel_connect(void);
+void wifi_manager_stop_visualizer(void);
+
 #ifdef CONFIG_WITH_ETHERNET
 static volatile bool g_eth_scan_cancel = false;
 #endif
@@ -764,11 +812,21 @@ void handle_stop_flipper(int argc, char **argv) {
     }
 
     stop_wardriving();
+    if (!esp_comm_manager_is_remote_command()) {
+        if (esp_comm_manager_is_connected()) {
+            bool peer_stop_ok = esp_comm_manager_send_command("startwd", "-s --helper");
+            glog(peer_stop_ok
+                     ? "Wardrive helper stop sent to peer.\n"
+                     : "Wardrive helper stop could not be sent to peer.\n");
+        }
+        wardriving_set_peer_assist(false);
+    }
     wifi_manager_stop_deauth();
+    wifi_manager_cancel_connect();
 #ifndef CONFIG_IDF_TARGET_ESP32S2
-    ble_stop();
-    ble_stop_gatt_scan();
     ble_spam_stop();
+    ble_stop_gatt_scan();
+    ble_stop();
 #endif
     if (csv_buffer_has_pending_data()) { // Only flush if there's data in buffer
         csv_flush_buffer_to_file();
@@ -813,6 +871,7 @@ void handle_stop_flipper(int argc, char **argv) {
     dhcp_starvation_stop();
     wifi_manager_stop_eapollogoff_attack();
     wifi_manager_stop_sae_flood();
+    wifi_manager_stop_karma();            // stop karma attack (sets flag; task self-exits)
     wifi_manager_stop_evil_portal();  // stop evil portal and flush credentials
     wifi_manager_stop_tracking();  // stop ap/sta rssi tracking
     wifi_manager_stop_beacon();  // stop beacon spam
@@ -830,8 +889,7 @@ void handle_stop_flipper(int argc, char **argv) {
 
     // kill any feature tasks we spawned that may still be around
     if (VisualizerHandle != NULL) {
-        vTaskDelete(VisualizerHandle);
-        VisualizerHandle = NULL;
+        wifi_manager_stop_visualizer();
     }
     settings_restart_rgb_effect();
 }
@@ -845,7 +903,10 @@ void handle_dial_command(int argc, char **argv) {
             dial_manager_set_device_name(argv[i]);
         }
     }
-    xTaskCreate(&discover_task, "discover_task", DISCOVER_TASK_STACK, NULL, 5, NULL);
+    BaseType_t rc = xTaskCreate(&discover_task, "discover_task", DISCOVER_TASK_STACK, NULL, 5, NULL);
+    if (rc != pdPASS) {
+        glog("Failed to start DIAL discovery task (err=%ld).\n", (long)rc);
+    }
 }
 
 static void dump_task_stacks(void) {
@@ -1036,14 +1097,16 @@ void handle_wifi_connection(int argc, char **argv) {
 #endif
     }
 
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "pool.ntp.org");
-    
+    if (!esp_sntp_enabled()) {
+        esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        esp_sntp_setservername(0, "pool.ntp.org");
+
 #ifdef CONFIG_HAS_RTC_CLOCK
-    esp_sntp_set_time_sync_notification_cb(sntp_time_sync_callback);
+        esp_sntp_set_time_sync_notification_cb(sntp_time_sync_callback);
 #endif
-    
-    esp_sntp_init();
+
+        esp_sntp_init();
+    }
 }
 
 void handle_wifi_disconnect(int argc, char **argv)
@@ -1058,8 +1121,7 @@ void handle_wifi_disconnect(int argc, char **argv)
 
     // kill any lingering visualizer task started on connect
     if (VisualizerHandle != NULL) {
-        vTaskDelete(VisualizerHandle);
-        VisualizerHandle = NULL;
+        wifi_manager_stop_visualizer();
     }
 }
 
@@ -1175,7 +1237,7 @@ void handle_start_portal(int argc, char **argv) {
     glog("Starting portal with AP_SSID: %s, PSK: %s, Domain: %s\n", ap_ssid, psk, domain ? domain : "(default)");
     char log_buf[256];
     snprintf(log_buf, sizeof(log_buf), "Starting portal with AP_SSID: %s, PSK: %s, Domain: %s\n", ap_ssid, (strlen(psk) > 0 ? psk : "<Open>"), domain ? domain : "(default)");
-    TERMINAL_VIEW_ADD_TEXT(log_buf);
+    TERMINAL_VIEW_ADD_TEXT("%s", log_buf);
     wifi_manager_start_evil_portal(final_url_or_path, NULL, psk, ap_ssid, domain);
 }
 
@@ -3572,26 +3634,93 @@ void handle_time_cmd(int argc, char **argv) {
 
 void handle_startwd(int argc, char **argv) {
     bool stop_flag = false;
+    bool helper_mode = false;
+    char helper_channels_csv[192] = {0};
+    bool helper_channels_set = false;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-s") == 0) {
             stop_flag = true;
-            break;
+        } else if (strcmp(argv[i], "--helper") == 0) {
+            helper_mode = true;
+        } else if (strcmp(argv[i], "--channels") == 0) {
+            if (i + 1 >= argc) {
+                glog("startwd: --channels requires a value\n");
+                return;
+            }
+            strncpy(helper_channels_csv, argv[++i], sizeof(helper_channels_csv) - 1);
+            helper_channels_set = true;
+        } else if (strncmp(argv[i], "--channels=", 11) == 0) {
+            strncpy(helper_channels_csv, argv[i] + 11, sizeof(helper_channels_csv) - 1);
+            helper_channels_set = true;
         }
     }
 
     if (stop_flag) {
+        if (!helper_mode && !esp_comm_manager_is_remote_command()) {
+            if (esp_comm_manager_is_connected()) {
+                bool peer_stop_ok = esp_comm_manager_send_command("startwd", "-s --helper");
+                glog(peer_stop_ok
+                         ? "Wardrive helper stop sent to peer.\n"
+                         : "Wardrive helper stop could not be sent to peer.\n");
+            }
+            wardriving_set_peer_assist(false);
+        }
+
         stop_wardriving();
         wifi_manager_stop_monitor_mode();
-        if (csv_buffer_has_pending_data()) { // Only flush if there's data in buffer
-            csv_flush_buffer_to_file();
+        if (!helper_mode) {
+            if (csv_buffer_has_pending_data()) { // Only flush if there's data in buffer
+                csv_flush_buffer_to_file();
+            }
+            csv_file_close();
+            gps_manager_deinit(&g_gpsManager);
+            glog("Wardriving stopped.\n");
+            status_display_show_status("Wardrive Stop");
+        } else {
+            (void)wardriving_set_helper_channels_from_csv(NULL);
+            glog("Wardriving helper stopped.\n");
+            status_display_show_status("WD Helper Stop");
         }
-        csv_file_close();
-        gps_manager_deinit(&g_gpsManager);
-        glog("Wardriving stopped.\n");
-        status_display_show_status("Wardrive Stop");
     } else {
-        gps_manager_init(&g_gpsManager);
+        if (helper_mode) {
+            if (helper_channels_set) {
+                if (!wardriving_set_helper_channels_from_csv(helper_channels_csv)) {
+                    glog("Wardriving helper: invalid channel list, using default helper channels.\n");
+                }
+            } else {
+                (void)wardriving_set_helper_channels_from_csv(NULL);
+            }
+
+            if (!g_gpsManager.isinitilized) {
+                gps_manager_init(&g_gpsManager);
+            }
+
+            wifi_manager_start_monitor_mode(wardriving_scan_callback);
+            start_wardriving_helper();
+            glog("Wardriving helper started.\n");
+            status_display_show_status("WD Helper Start");
+            return;
+        }
+
+        bool prefer_peer_only = false;
+#ifdef CONFIG_BUILD_CONFIG_TEMPLATE
+        prefer_peer_only = (strcmp(CONFIG_BUILD_CONFIG_TEMPLATE, "somethingsomething") == 0) &&
+                           !esp_comm_manager_is_remote_command() &&
+                           esp_comm_manager_is_connected();
+#endif
+
+        if (prefer_peer_only) {
+            gps_manager_set_peer_gps_preferred(true);
+            gps_manager_clear_peer_fix();
+            if (g_gpsManager.isinitilized) {
+                gps_manager_deinit(&g_gpsManager);
+            }
+            glog("Wardriving: peer GPS preferred, local soft GPS disabled.\n");
+        } else {
+            gps_manager_set_peer_gps_preferred(false);
+            gps_manager_init(&g_gpsManager);
+        }
         esp_err_t err = csv_file_open("wardriving");
         if (err != ESP_OK) {
             glog("Failed to open CSV for wardriving\n");
@@ -3599,6 +3728,34 @@ void handle_startwd(int argc, char **argv) {
         }
         wifi_manager_start_monitor_mode(wardriving_scan_callback);
         start_wardriving();
+
+        bool peer_helper_ok = false;
+        if (!esp_comm_manager_is_remote_command()) {
+            if (esp_comm_manager_is_connected()) {
+                char helper_args[256] = "--helper";
+                char helper_plan_csv[192] = {0};
+                if (wardriving_get_helper_channel_plan_csv(helper_plan_csv, sizeof(helper_plan_csv))) {
+                    snprintf(helper_args, sizeof(helper_args), "--helper --channels %s", helper_plan_csv);
+                }
+                peer_helper_ok = esp_comm_manager_send_command("startwd", helper_args);
+                glog(peer_helper_ok
+                         ? "Wardrive helper started on peer (split-channel).\n"
+                         : "Wardrive helper not started on peer; continuing local only.\n");
+            } else {
+                glog("Wardrive helper unavailable: no GhostLink peer connected.\n");
+            }
+        }
+        wardriving_set_peer_assist(peer_helper_ok);
+
+        if (prefer_peer_only && !peer_helper_ok) {
+            gps_manager_set_peer_gps_preferred(false);
+            gps_manager_clear_peer_fix();
+            if (!g_gpsManager.isinitilized) {
+                gps_manager_init(&g_gpsManager);
+            }
+            glog("Wardriving: peer helper unavailable, falling back to local GPS.\n");
+        }
+
         glog("Wardriving started.\n");
         status_display_show_status("Wardrive Start");
     }
@@ -3717,10 +3874,132 @@ void handle_scan_ssh(int argc, char **argv) {
 }
 
 void handle_crash(int argc, char **argv) {
+    glog("Triggering crash for coredump test...\n");
+    (void)argc;
+    (void)argv;
+    /* Intentional null pointer write to trigger panic; coredump will be saved to flash. */
     int *ptr = NULL;
     *ptr = 42;
 }
 
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+/* Read coredump partition and print summary or stream base64 for host decode. */
+static void handle_coredump_cmd(int argc, char **argv) {
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_DATA_COREDUMP,
+        NULL);
+    if (part == NULL) {
+        glog("No coredump partition found. Check partition table.\n");
+        return;
+    }
+
+    if (argc > 1 && strcmp(argv[1], "erase") == 0) {
+        /* Use partition erase on all targets (esp_core_dump_image_erase can fail on plain ESP32). */
+        size_t esz = part->erase_size;
+        size_t to_erase = (part->size / esz) * esz;
+        if (to_erase == 0) {
+            to_erase = esz;
+        }
+        esp_err_t err = esp_partition_erase_range(part, 0, to_erase);
+        if (err == ESP_OK) {
+            glog("Coredump partition erased.\n");
+        } else {
+            glog("Failed to erase coredump: %s\n", esp_err_to_name(err));
+        }
+        return;
+    }
+
+    const int do_dump = (argc > 1 && strcmp(argv[1], "dump") == 0);
+
+    if (do_dump) {
+        /* Stream partition as base64 so user can save and run: idf.py coredump-info -c <file> */
+        glog("=== COREDUMP BASE64 START ===\n");
+        glog("Save the lines below to a file (e.g. coredump.b64), then run:\n");
+        glog("  idf.py coredump-info -c coredump.b64\n");
+        glog("(Omit the start/end marker lines from the file.)\n");
+        uint8_t buf[768];  /* multiple of 3 for base64 */
+        char b64[1024 + 8];
+        size_t offset = 0;
+        while (offset < part->size) {
+            size_t chunk = (part->size - offset) > sizeof(buf) ? sizeof(buf) : (part->size - offset);
+            if (esp_partition_read(part, offset, buf, chunk) != ESP_OK) {
+                glog("\nRead error at offset %u\n", (unsigned)offset);
+                break;
+            }
+            size_t written = 0;
+            int ret = mbedtls_base64_encode((unsigned char *)b64, sizeof(b64), &written, buf, chunk);
+            if (ret != 0) {
+                glog("\nBase64 encode error\n");
+                break;
+            }
+            b64[written] = '\0';
+            glog("%s", b64);
+            offset += chunk;
+        }
+        glog("\n=== COREDUMP BASE64 END ===\n");
+        return;
+    }
+
+    /* Summary: partition info and whether it contains valid coredump data.
+     * ESP-IDF may write a small header (e.g. checksum) before the ELF, so scan
+     * the first 128 bytes for ELF magic (0x7f 'E' 'L' 'F') instead of only offset 0. */
+    uint8_t head[128];
+    size_t head_len = part->size < sizeof(head) ? (size_t)part->size : sizeof(head);
+    if (esp_partition_read(part, 0, head, head_len) != ESP_OK) {
+        glog("Failed to read coredump partition.\n");
+        return;
+    }
+    int elf_offset = -1;
+    for (size_t i = 0; i + 4 <= head_len; i++) {
+        if (head[i] == 0x7f && head[i + 1] == 'E' && head[i + 2] == 'L' && head[i + 3] == 'F') {
+            elf_offset = (int)i;
+            break;
+        }
+    }
+    const int is_elf = (elf_offset >= 0);
+
+    glog("Coredump partition: %s, size %u bytes\n", part->label, (unsigned)part->size);
+
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+    /* Use ESP-IDF API to parse and print panic reason from coredump in flash */
+    {
+        char panic_reason[256];
+        esp_err_t err = esp_core_dump_get_panic_reason(panic_reason, sizeof(panic_reason));
+        if (err == ESP_OK && panic_reason[0] != '\0') {
+            glog("Panic reason: %s\n", panic_reason);
+        } else if (err == ESP_ERR_NOT_FOUND) {
+            /* Do not call esp_core_dump_get_summary() here: it uses too much stack and can
+             * cause Stack protection fault in SerialTask (same task as CLI). */
+            glog("Panic reason: (not available on device; run idf.py coredump-info on host)\n");
+        } else {
+            glog("Panic reason: (error %s)\n", esp_err_to_name(err));
+        }
+    }
+#endif
+
+    if (is_elf) {
+        glog("Coredump data: present (ELF format");
+        if (elf_offset > 0) {
+            glog(", ELF at offset %d", elf_offset);
+        }
+        glog(").\n");
+        glog("For full backtrace run on host: idf.py coredump-info\n");
+    } else {
+        /* Check for empty (all 0xff) or binary format */
+        int empty = 1;
+        for (size_t i = 0; i < head_len && empty; i++) {
+            if (head[i] != 0xff) empty = 0;
+        }
+        if (empty != 0) {
+            glog("Coredump data: partition empty (no crash recorded yet).\n");
+        } else {
+            glog("Coredump data: present (binary format).\n");
+            glog("For full backtrace run on host: idf.py coredump-info\n");
+        }
+    }
+}
+#endif /* CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH */
 
 // Help command
 void handle_help(int argc, char **argv) {
@@ -3991,6 +4270,18 @@ void handle_help(int argc, char **argv) {
         glog("        - CPU cores and features\n");
         glog("        - Flash size and memory info\n");
         glog("        - ESP-IDF version\n\n");
+        glog("crash\n");
+        glog("    Description: Intentionally trigger a crash (for coredump testing).\n");
+        glog("    Usage: crash\n");
+        glog("    The device will panic and save a coredump to flash; use idf.py coredump-info to inspect.\n\n");
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+        glog("coredump [dump|erase]\n");
+        glog("    Description: Read or clear coredump in flash.\n");
+        glog("    Usage: coredump        - Print summary (partition size, whether coredump present).\n");
+        glog("           coredump dump   - Stream coredump as base64; save to file and run idf.py coredump-info -c <file> on host.\n");
+        glog("           coredump erase  - Erase coredump partition (clears saved crash).\n");
+        glog("    With device connected, 'idf.py coredump-info' on host shows full panic reason and backtrace.\n\n");
+#endif
         glog("timezone\n");
         glog("    Description: Set the display timezone for the clock view.\n");
         glog("    Usage: timezone <TZ_STRING>\n\n");
@@ -4035,7 +4326,20 @@ void handle_help(int argc, char **argv) {
         glog("\nGPS Commands:\n\n");
         glog("gpsinfo\n    Show GPS info.\n    Usage: gpsinfo [-s]\n\n");
         glog("gpspin\n    Set GPS RX pin for external GPS module.\n    Usage: gpspin <pin>\n\n");
-        glog("startwd\n    Start GPS wardriving.\n    Usage: startwd [seconds]\n\n");
+        glog("startwd\n    Start GPS wardriving.\n    Usage: startwd [-s] [--helper] [--channels <csv>]\n\n");
+        return;
+    }
+    if (strcmp(category, "wigle") == 0) {
+        glog("\nWiGLE Commands:\n\n");
+        glog("wigle API <name>:<token>\n    Set WiGLE API credentials.\n\n");
+        glog("wigle auto on/off\n    Enable/disable auto-upload.\n\n");
+        glog("wigle donate on/off\n    Enable/disable WiGLE donate flag.\n\n");
+        glog("wigle show\n    Show WiGLE settings.\n\n");
+        glog("wigle list\n    Show uploaded CSV memory.\n\n");
+        glog("wigle files [page]\n    List CSVs in /mnt/ghostesp/gps/ for manual upload.\n\n");
+        glog("wigle upload <filename>\n    Upload a specific CSV file.\n\n");
+        glog("wigle upload all\n    Upload all pending queue files.\n\n");
+        glog("wigle stats\n    Show account stats for current API key.\n\n");
         return;
     }
     if (strcmp(category, "portal") == 0) {
@@ -4294,6 +4598,7 @@ void handle_help(int argc, char **argv) {
     glog("  help sd        - SD card commands\n");
     glog("  help led       - LED/RGB commands\n");
     glog("  help gps       - GPS commands\n");
+    glog("  help wigle     - WiGLE commands\n");
     glog("  help misc      - Miscellaneous commands\n");
     glog("  help portal    - Evil Portal commands\n");
     glog("  help printer   - Printer commands\n");
@@ -4316,6 +4621,7 @@ void handle_help(int argc, char **argv) {
         "  help sd        - SD card commands\n"
         "  help led       - LED/RGB commands\n"
         "  help gps       - GPS commands\n"
+        "  help wigle     - WiGLE commands\n"
         "  help misc      - Miscellaneous commands\n");
     glog("  help portal    - Evil Portal commands\n"
          "  help printer   - Printer commands\n"
@@ -4403,13 +4709,24 @@ void handle_gps_info(int argc, char **argv) {
             }
             
             gps_manager_deinit(&g_gpsManager);
+            gps_manager_set_peer_gps_preferred(false);
+            gps_manager_clear_peer_fix();
             printf("GPS info display stopped.\n");
             TERMINAL_VIEW_ADD_TEXT("GPS info display stopped.\n");
             status_display_show_status("GPS Info Off");
         }
     } else {
         if (gps_info_task_handle == NULL) {
-            gps_manager_init(&g_gpsManager);
+            bool peer_connected = esp_comm_manager_is_connected();
+            gps_manager_set_peer_gps_preferred(peer_connected);
+            if (!peer_connected) {
+                gps_manager_clear_peer_fix();
+            }
+            if (!peer_connected) {
+                gps_manager_init(&g_gpsManager);
+            } else if (g_gpsManager.isinitilized) {
+                gps_manager_deinit(&g_gpsManager);
+            }
 
             // Wait a moment for GPS initialization
             vTaskDelay(pdMS_TO_TICKS(100));
@@ -4464,6 +4781,13 @@ void handle_gps_info(int argc, char **argv) {
             gps_info_task_handle = created_task;
             printf("GPS info started.\n");
             TERMINAL_VIEW_ADD_TEXT("GPS info started.\n");
+            if (peer_connected) {
+                printf("GPS source: peer stream preferred.\n");
+                TERMINAL_VIEW_ADD_TEXT("GPS source: peer stream preferred.\n");
+            } else {
+                printf("GPS source: local parser.\n");
+                TERMINAL_VIEW_ADD_TEXT("GPS source: local parser.\n");
+            }
             status_display_show_status("GPS Info On");
         }
     }
@@ -4487,12 +4811,21 @@ void handle_ble_wardriving(int argc, char **argv) {
         }
         csv_file_close();
         gps_manager_deinit(&g_gpsManager);
+        gps_manager_set_peer_gps_preferred(false);
+        gps_manager_clear_peer_fix();
         printf("BLE wardriving stopped.\n");
         TERMINAL_VIEW_ADD_TEXT("BLE wardriving stopped.\n");
         status_display_show_status("BLE Drive Off");
     } else {
-        if (!g_gpsManager.isinitilized) {
+        bool peer_connected = esp_comm_manager_is_connected();
+        gps_manager_set_peer_gps_preferred(peer_connected);
+        if (!peer_connected) {
+            gps_manager_clear_peer_fix();
+        }
+        if (!peer_connected && !g_gpsManager.isinitilized) {
             gps_manager_init(&g_gpsManager);
+        } else if (peer_connected && g_gpsManager.isinitilized) {
+            gps_manager_deinit(&g_gpsManager);
         }
 
         // Open CSV file for BLE wardriving
@@ -4507,6 +4840,13 @@ void handle_ble_wardriving(int argc, char **argv) {
         ble_register_handler(ble_wardriving_callback);
         printf("BLE wardriving started.\n");
         TERMINAL_VIEW_ADD_TEXT("BLE wardriving started.\n");
+        if (peer_connected) {
+            printf("BLE wardriving GPS source: peer stream preferred.\n");
+            TERMINAL_VIEW_ADD_TEXT("BLE wardriving GPS source: peer stream preferred.\n");
+        } else {
+            printf("BLE wardriving GPS source: local parser.\n");
+            TERMINAL_VIEW_ADD_TEXT("BLE wardriving GPS source: local parser.\n");
+        }
         status_display_show_status("BLE Drive On");
     }
 }
@@ -5140,15 +5480,37 @@ void handle_sd_cmd(int argc, char **argv) {
             return;
         }
 
+        bool raw_output = (strcmp(sub, "cat") == 0);
         long offset = 0;
         size_t max_bytes = 0;
-        if (argc >= 4) {
-            offset = strtol(argv[3], NULL, 10);
-            if (offset < 0) offset = 0;
-        }
-        if (argc >= 5) {
-            int mb = atoi(argv[4]);
-            if (mb > 0) max_bytes = (size_t)mb;
+        int numeric_arg_count = 0;
+        for (int i = 3; i < argc; i++) {
+            if (strcmp(argv[i], "--raw") == 0) {
+                raw_output = true;
+                continue;
+            }
+
+            char *endptr = NULL;
+            long v = strtol(argv[i], &endptr, 10);
+            if (endptr == argv[i] || *endptr != '\0') {
+                glog("SD:ERR:invalid_arg:%s\n", argv[i]);
+                sd_cli_cleanup();
+                return;
+            }
+
+            if (numeric_arg_count == 0) {
+                offset = v;
+                if (offset < 0) offset = 0;
+            } else if (numeric_arg_count == 1) {
+                if (v > 0) {
+                    max_bytes = (size_t)v;
+                }
+            } else {
+                glog("SD:ERR:too_many_args\n");
+                sd_cli_cleanup();
+                return;
+            }
+            numeric_arg_count++;
         }
 
         FILE *f = fopen(resolved, "rb");
@@ -5166,10 +5528,12 @@ void handle_sd_cmd(int argc, char **argv) {
             max_bytes = (size_t)(file_size - offset);
         }
 
-        glog("SD:READ:BEGIN:%s\n", resolved);
-        glog("SD:READ:SIZE:%ld\n", file_size);
-        glog("SD:READ:OFFSET:%ld\n", offset);
-        glog("SD:READ:LENGTH:%zu\n", max_bytes);
+        if (!raw_output) {
+            glog("SD:READ:BEGIN:%s\n", resolved);
+            glog("SD:READ:SIZE:%ld\n", file_size);
+            glog("SD:READ:OFFSET:%ld\n", offset);
+            glog("SD:READ:LENGTH:%zu\n", max_bytes);
+        }
 
         char *buf = malloc(1024);
         if (!buf) {
@@ -5180,19 +5544,41 @@ void handle_sd_cmd(int argc, char **argv) {
 
         size_t total_read = 0;
         size_t n;
+        bool read_failed = false;
         while (total_read < max_bytes && (n = fread(buf, 1, 1024, f)) > 0) {
             size_t to_write = n;
             if (total_read + to_write > max_bytes) {
                 to_write = max_bytes - total_read;
             }
-            fwrite(buf, 1, to_write, stdout);
+            size_t out_written = fwrite(buf, 1, to_write, stdout);
+            if (out_written != to_write) {
+                if (raw_output) {
+                    glog("SD:ERR:stdout_write_failed\n");
+                } else {
+                    glog("\nSD:ERR:stdout_write_failed\n");
+                }
+                read_failed = true;
+                break;
+            }
             total_read += to_write;
+        }
+        if (ferror(f)) {
+            if (raw_output) {
+                glog("SD:ERR:file_read_failed\n");
+            } else {
+                glog("\nSD:ERR:file_read_failed\n");
+            }
+            read_failed = true;
         }
         free(buf);
         fclose(f);
 
-        glog("\nSD:READ:END:bytes=%zu\n", total_read);
-        glog("SD:OK\n");
+        if (!raw_output) {
+            glog("\nSD:READ:END:bytes=%zu\n", total_read);
+            if (!read_failed) {
+                glog("SD:OK\n");
+            }
+        }
         sd_cli_cleanup();
         return;
     }
@@ -5244,11 +5630,16 @@ void handle_sd_cmd(int argc, char **argv) {
         }
 
         size_t written = fwrite(decoded, 1, olen, f);
+        int write_failed = ferror(f);
         fclose(f);
         free(decoded);
 
         glog("SD:WRITE:bytes=%zu\n", written);
-        glog("SD:OK:created:%s\n", path);
+        if (write_failed || written != olen) {
+            glog("SD:ERR:short_write:%s\n", path);
+        } else {
+            glog("SD:OK:created:%s\n", path);
+        }
         sd_cli_cleanup();
         return;
     }
@@ -5300,11 +5691,16 @@ void handle_sd_cmd(int argc, char **argv) {
         }
 
         size_t written = fwrite(decoded, 1, olen, f);
+        int write_failed = ferror(f);
         fclose(f);
         free(decoded);
 
         glog("SD:APPEND:bytes=%zu\n", written);
-        glog("SD:OK:appended:%s\n", path);
+        if (write_failed || written != olen) {
+            glog("SD:ERR:short_write:%s\n", path);
+        } else {
+            glog("SD:OK:appended:%s\n", path);
+        }
         sd_cli_cleanup();
         return;
     }
@@ -6520,6 +6916,9 @@ void handle_chip_info_cmd(int argc, char **argv) {
 #if defined(CONFIG_HAS_BADUSB) || defined(CONFIG_HAS_BADUSB_REMOTE)
     glog("    BadUSB\n");
 #endif
+#if defined(CONFIG_HAS_NRF24) || defined(CONFIG_HAS_NRF24_REMOTE)
+    glog("    NRF24\n");
+#endif
 #ifdef CONFIG_HAS_INFRARED
     glog("    Infrared TX\n");
 #endif
@@ -6576,6 +6975,9 @@ void handle_chip_info_cmd(int argc, char **argv) {
 #endif
 #if defined(CONFIG_USING_MMC) || defined(CONFIG_USING_MMC_1_BIT)
     glog("    SD Card (MMC)\n");
+#endif
+#ifdef CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+    glog("    Core Dump\n");
 #endif
     
     glog("[CHIPINFO_END]\n");
@@ -6656,6 +7058,10 @@ void handle_settings_cmd(int argc, char **argv) {
         glog("    flappy_name       - Flappy Ghost name\n");
         glog("    timezone          - Selected timezone\n");
         glog("    accent_color      - Accent color (hex)\n");
+        glog("  IO expander buttons (P10/P11/P12):\n");
+        glog("    io_btn_p10_cmd    - Command to run when P10 pressed (empty = joystick)\n");
+        glog("    io_btn_p11_cmd    - Command to run when P11 pressed (empty = joystick)\n");
+        glog("    io_btn_p12_cmd    - Command to run when P12 pressed (empty = joystick)\n");
         return;
     }
 
@@ -6826,10 +7232,10 @@ void handle_chameleon_cmd(int argc, char **argv) {
         }
         
         if (pin != NULL) {
-            printf("Connecting to Chameleon Ultra with %lu second timeout and PIN...\n", timeout);
+            printf("Connecting to Chameleon Ultra with %lu second timeout and PIN...\n", (unsigned long)timeout);
             TERMINAL_VIEW_ADD_TEXT("Connecting to Chameleon Ultra with PIN...\n");
         } else {
-            printf("Connecting to Chameleon Ultra with %lu second timeout...\n", timeout);
+            printf("Connecting to Chameleon Ultra with %lu second timeout...\n", (unsigned long)timeout);
             TERMINAL_VIEW_ADD_TEXT("Connecting to Chameleon Ultra...\n");
         }
         
@@ -7337,6 +7743,132 @@ static size_t badusb_join_args(char *out, size_t out_len, int argc, char **argv,
         out[used] = '\0';
     }
     return used;
+}
+
+void handle_nrf24_cmd(int argc, char **argv) {
+    if (argc < 2) {
+        glog("Usage: nrf24 <start|stop|pause|resume|status|state>\n");
+        return;
+    }
+
+    const char *sub = argv[1];
+    bool remote_request = esp_comm_manager_is_remote_command();
+
+#if defined(CONFIG_WITH_SCREEN) && (defined(CONFIG_HAS_NRF24) || defined(CONFIG_HAS_NRF24_REMOTE))
+    if (strcmp(sub, "state") == 0) {
+        if (argc >= 3) {
+            nrf24_analyzer_view_update_remote_state(argv[2]);
+        }
+        return;
+    }
+#endif
+
+#ifdef CONFIG_HAS_NRF24
+    bool stream_to_peer = remote_request && esp_comm_manager_is_connected();
+
+    if (strcmp(sub, "start") == 0) {
+        bool ok = nrf24_remote_manager_start(stream_to_peer);
+        if (ok) {
+            glog("NRF24 analyzer started\n");
+            glog("NRF24 cfg: SPI%d MOSI=%d MISO=%d SCK=%d CSN=%d CE=%d\n",
+                 CONFIG_NRF24_SPI_HOST,
+                 CONFIG_NRF24_SPI_MOSI_PIN,
+                 CONFIG_NRF24_SPI_MISO_PIN,
+                 CONFIG_NRF24_SPI_SCK_PIN,
+                 CONFIG_NRF24_CSN_PIN,
+                 CONFIG_NRF24_CE_PIN);
+            if (stream_to_peer) {
+                esp_comm_manager_send_command("nrf24", "state started");
+            }
+        } else {
+            glog("NRF24 analyzer failed to start: %s\n", nrf24_remote_manager_get_last_error());
+            glog("NRF24 cfg: SPI%d MOSI=%d MISO=%d SCK=%d CSN=%d CE=%d\n",
+                 CONFIG_NRF24_SPI_HOST,
+                 CONFIG_NRF24_SPI_MOSI_PIN,
+                 CONFIG_NRF24_SPI_MISO_PIN,
+                 CONFIG_NRF24_SPI_SCK_PIN,
+                 CONFIG_NRF24_CSN_PIN,
+                 CONFIG_NRF24_CE_PIN);
+            if (stream_to_peer) {
+                esp_comm_manager_send_command("nrf24", "state error");
+            }
+        }
+        return;
+    }
+
+    if (strcmp(sub, "stop") == 0) {
+        if (!nrf24_remote_manager_is_running()) {
+            glog("NRF24 analyzer already stopped\n");
+            if (stream_to_peer) {
+                esp_comm_manager_send_command("nrf24", "state stopped");
+            }
+            return;
+        }
+        nrf24_remote_manager_stop();
+        glog("NRF24 analyzer stopping\n");
+        if (stream_to_peer) {
+            esp_comm_manager_send_command("nrf24", "state stopped");
+        }
+        return;
+    }
+
+    if (strcmp(sub, "pause") == 0) {
+        if (!nrf24_remote_manager_is_running()) {
+            glog("NRF24 analyzer is not running\n");
+            if (stream_to_peer) {
+                esp_comm_manager_send_command("nrf24", "state error");
+            }
+            return;
+        }
+        nrf24_remote_manager_set_paused(true);
+        glog("NRF24 analyzer paused\n");
+        if (stream_to_peer) {
+            esp_comm_manager_send_command("nrf24", "state paused");
+        }
+        return;
+    }
+
+    if (strcmp(sub, "resume") == 0) {
+        if (!nrf24_remote_manager_is_running()) {
+            glog("NRF24 analyzer is not running\n");
+            if (stream_to_peer) {
+                esp_comm_manager_send_command("nrf24", "state error");
+            }
+            return;
+        }
+        nrf24_remote_manager_set_paused(false);
+        glog("NRF24 analyzer resumed\n");
+        if (stream_to_peer) {
+            esp_comm_manager_send_command("nrf24", "state resumed");
+        }
+        return;
+    }
+
+    if (strcmp(sub, "status") == 0) {
+        glog("NRF24 running: %s\n", nrf24_remote_manager_is_running() ? "yes" : "no");
+        glog("NRF24 paused: %s\n", nrf24_remote_manager_is_paused() ? "yes" : "no");
+        glog("NRF24 last error: %s\n", nrf24_remote_manager_get_last_error());
+        glog("NRF24 cfg: SPI%d MOSI=%d MISO=%d SCK=%d CSN=%d CE=%d\n",
+             CONFIG_NRF24_SPI_HOST,
+             CONFIG_NRF24_SPI_MOSI_PIN,
+             CONFIG_NRF24_SPI_MISO_PIN,
+             CONFIG_NRF24_SPI_SCK_PIN,
+             CONFIG_NRF24_CSN_PIN,
+             CONFIG_NRF24_CE_PIN);
+        return;
+    }
+
+    glog("Unknown nrf24 subcommand: %s\n", sub);
+#else
+#ifdef CONFIG_HAS_NRF24_REMOTE
+    glog("NRF24 local scanner not enabled on this build (remote/display role only)\n");
+#else
+    glog("NRF24 not enabled on this build\n");
+#endif
+    if (remote_request && esp_comm_manager_is_connected()) {
+        esp_comm_manager_send_command("nrf24", "state error");
+    }
+#endif
 }
 
 static void badusb_strip_quotes(char *text) {
@@ -7955,10 +8487,38 @@ void handle_input_cmd(int argc, char **argv) {
     if (input_queue) {
         InputEvent evt = {
             .type = INPUT_TYPE_JOYSTICK,
-            .data.joystick_index = joystick_index
+            .data.joystick_index = joystick_index,
+            .data.joystick_pressed = true
         };
         xQueueSend(input_queue, &evt, 0);
     }
+}
+
+void handle_iobtn_cmd(int argc, char **argv) {
+    if (argc < 2) {
+        glog("Usage: iobtn <1|2|3> [command]\n");
+        glog("  Button 1 = P10, 2 = P11, 3 = P12. Show or set command run on press.\n");
+        glog("  Omit [command] to show current; use \"\" to clear (then button sends joystick event).\n");
+        return;
+    }
+    int btn = atoi(argv[1]);
+    if (btn < 1 || btn > 3) {
+        glog("Button must be 1, 2, or 3 (P10, P11, P12)\n");
+        return;
+    }
+    const char *cur = NULL;
+    if (btn == 1) cur = settings_get_io_btn_p10_cmd(&G_Settings);
+    else if (btn == 2) cur = settings_get_io_btn_p11_cmd(&G_Settings);
+    else cur = settings_get_io_btn_p12_cmd(&G_Settings);
+    if (argc == 2) {
+        glog("P1%u: \"%s\"\n", (unsigned)(btn + 9), cur && cur[0] ? cur : "(none)");
+        return;
+    }
+    if (btn == 1) settings_set_io_btn_p10_cmd(&G_Settings, argv[2]);
+    else if (btn == 2) settings_set_io_btn_p11_cmd(&G_Settings, argv[2]);
+    else settings_set_io_btn_p12_cmd(&G_Settings, argv[2]);
+    settings_save(&G_Settings);
+    glog("P1%u command set to \"%s\"\n", (unsigned)(btn + 9), argv[2][0] ? argv[2] : "(cleared)");
 }
 
 void handle_usb_kbd_cmd(int argc, char **argv) {
@@ -8183,10 +8743,13 @@ void handle_wigle_cmd(int argc, char **argv) {
     if (argc < 2) {
         glog("wigle API <name>:<token>  - Set Wigle API key (from wigle.net/account)\n");
         glog("wigle auto on/off          - Auto-upload at boot\n");
-        glog("wigle donate on/off         - Donate data to Wigle\n");
-        glog("wigle show                  - Show current settings\n");
-        glog("wigle list                  - List stored uploaded CSV memory\n");
-        glog("wigle upload                - Manually trigger upload\n");
+        glog("wigle donate on/off        - Donate data to Wigle\n");
+        glog("wigle show                 - Show current settings\n");
+        glog("wigle list                 - List stored uploaded CSV memory\n");
+        glog("wigle files [page]         - List GPS CSV files for manual upload\n");
+        glog("wigle upload <filename>    - Upload one CSV from /mnt/ghostesp/gps\n");
+        glog("wigle upload all           - Upload all pending CSVs\n");
+        glog("wigle stats                - Show WiGLE account stats\n");
         return;
     }
     if (strcmp(argv[1], "API") == 0 || strcmp(argv[1], "api") == 0) {
@@ -8231,9 +8794,70 @@ void handle_wigle_cmd(int argc, char **argv) {
         wigle_uploaded_list();
         return;
     }
+    if (strcmp(argv[1], "files") == 0) {
+        int page = 1;
+        if (argc >= 3) {
+            page = atoi(argv[2]);
+            if (page < 1) page = 1;
+        }
+
+        const int page_size = 8;
+        int offset = (page - 1) * page_size;
+        char names[8][MAX_PORTAL_NAME];
+        bool has_more = false;
+        int count = wigle_list_csv_files_paged(offset, page_size, names, &has_more);
+        if (count < 0) {
+            glog("Failed to list CSV files in /mnt/ghostesp/gps\n");
+            return;
+        }
+        if (count == 0) {
+            glog("No CSV files found in /mnt/ghostesp/gps\n");
+            return;
+        }
+
+        glog("WiGLE CSV files (page %d):\n", page);
+        for (int i = 0; i < count; i++) {
+            int wifi_rows = 0;
+            int total_rows = 0;
+            esp_err_t info_err = wigle_get_csv_info(names[i], &wifi_rows, &total_rows);
+            if (info_err == ESP_OK) {
+                glog("  %s  [wifi=%d total=%d]\n", names[i], wifi_rows, total_rows);
+            } else {
+                glog("  %s\n", names[i]);
+            }
+        }
+        if (page > 1) {
+            glog("Previous: wigle files %d\n", page - 1);
+        }
+        if (has_more) {
+            glog("Next: wigle files %d\n", page + 1);
+        }
+        return;
+    }
     if (strcmp(argv[1], "upload") == 0) {
-        wigle_upload_all_async();
-        glog("Wigle upload started\n");
+        if (argc < 3 || strcmp(argv[2], "all") == 0) {
+            wigle_upload_all_async();
+            glog("Wigle upload started\n");
+            return;
+        }
+
+        char message[256];
+        esp_err_t err = wigle_upload_single_csv(argv[2], message, sizeof(message));
+        if (message[0]) {
+            glog("%s\n", message);
+        } else {
+            glog("%s\n", err == ESP_OK ? "Upload completed" : "Upload failed");
+        }
+        return;
+    }
+    if (strcmp(argv[1], "stats") == 0) {
+        char message[512];
+        esp_err_t err = wigle_get_stats(message, sizeof(message));
+        if (message[0]) {
+            glog("%s\n", message);
+        } else {
+            glog("%s\n", err == ESP_OK ? "Stats loaded" : "Failed to load stats");
+        }
         return;
     }
     glog("Unknown wigle command: %s\n", argv[1]);
@@ -8299,6 +8923,9 @@ void register_commands() {
 #ifdef DEBUG
     register_command("crash", handle_crash);
 #endif
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+    register_command("coredump", handle_coredump_cmd);
+#endif
     register_command("pineap", handle_pineap_detection);
     register_command("apcred", handle_apcred);
     register_command("apenable", handle_ap_enable_cmd);
@@ -8348,6 +8975,7 @@ void register_commands() {
 #ifdef CONFIG_HAS_INFRARED
     register_command("ir", handle_ir_cmd);
 #endif
+    register_command("nrf24", handle_nrf24_cmd);
     register_command("badusb", handle_badusb_cmd);
 #ifdef CONFIG_WITH_ETHERNET
     register_command("ethup", handle_eth_up_cmd);
@@ -8368,6 +8996,7 @@ void register_commands() {
 #endif
     register_command("mirror", handle_mirror_cmd);
     register_command("input", handle_input_cmd);
+    register_command("iobtn", handle_iobtn_cmd);
     register_command("identify", handle_identify_cmd);
 #if CONFIG_IDF_TARGET_ESP32S3
     register_command("usbkbd", handle_usb_kbd_cmd);

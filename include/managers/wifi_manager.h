@@ -168,6 +168,10 @@ void wifi_manager_start_ip_lookup();
 
 void wifi_manager_connect_wifi(const char *ssid, const char *password);
 
+void wifi_manager_cancel_connect(void);
+
+void wifi_manager_stop_visualizer(void);
+
 void wifi_manager_stop_monitor_mode();
 
 void wifi_manager_start_monitor_mode(wifi_promiscuous_cb_t_t callback);
@@ -232,7 +236,7 @@ bool wifi_manager_arp_scan_subnet(void);
 extern const uint16_t COMMON_PORTS[];
 extern const size_t NUM_PORTS;
 
-void wifi_manager_start_scan_with_time(int seconds);
+esp_err_t wifi_manager_start_scan_with_time(int seconds);
 
 void wifi_manager_scanall_chart(void);
 
@@ -265,6 +269,7 @@ void wifi_manager_clear_scan_results(void);
 void wifi_manager_start_karma(void);
 void wifi_manager_stop_karma(void);
 void wifi_manager_set_karma_ssid_list(const char **ssids, int count);
+void wifi_manager_set_karma_portal_file(const char *path);
 
 // RSSI tracking functions
 void wifi_manager_track_ap(void);

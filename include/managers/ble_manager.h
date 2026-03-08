@@ -3,6 +3,7 @@
 
 #include "esp_err.h"
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 #define MAX_UUID16 10
@@ -51,7 +52,7 @@ void ble_start_raw_ble_packetscan(void);
 void ble_start_blespam_detector(void);
 void ble_start_capture(void);
 void ble_start_capture_wireshark(void);
-void ble_start_scanning(void);
+bool ble_start_scanning(void);
 void ble_start_skimmer_detection(void);
 void ble_stop_skimmer_detection(void);
 

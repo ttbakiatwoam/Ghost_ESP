@@ -14,11 +14,19 @@ toc: true
 ## Core
 
 - **`help [category|all]`** — List commands by category (`wifi`, `ble`, `portal`, `comm`, `sd`, `led`, `gps`, `misc`, `printer`, `cast`, `capture`, `beacon`, `attack`, `ethernet`).
-- **`chipinfo`** — Print SoC model, cores, features, and IDF version.
+- **`chipinfo`** — Print SoC model, cores, features, and IDF version. When core dumps are enabled to flash, it also shows coredump partition status and (when available) the panic reason from the last crash.
 - (for developers) **`mem [dump|trace <start|stop|dump>]`** — Print heap stats, dump allocation state, or control heap tracing.
 - **`reboot`** — Soft restart the device.
 - **`timezone <TZ>`** — Set timezone, e.g., `timezone EST5EDT,M3.2.0,M11.1.0`.
 - **`stop`** — Stops all active attacks, scans, and background tasks. Also restarts Wi-Fi if it was suspended by BLE.
+
+### Core dumps (flash builds only)
+
+These commands are only present on builds that enable ESP-IDF core dumps **to flash** (`CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH`).
+
+- **`coredump`** — Print a quick summary (partition size and whether a coredump is present).
+- **`coredump dump`** — Stream the coredump partition as base64. Save the output body to `coredump.b64` (omit the start/end marker lines), then decode on your host with `idf.py coredump-info -c coredump.b64`.
+- **`coredump erase`** — Erase the coredump partition (clears the saved crash).
 
 ## WiFi
 
@@ -155,6 +163,17 @@ Available on boards with an onboard OLED status display or when an external stat
   - `statusidle` — Show the current idle animation and timeout.
   - `statusidle list` — List available idle animations.
   - `statusidle set <life|ghost|0|1>` — Select the idle animation mode.
+
+## IO expander buttons (if present)
+
+Available on boards with **CONFIG_USE_IO_EXPANDER**. Three physical buttons (P10, P11 “Right button”, P12) can each run a custom CLI command or act as a joystick button when no command is set.
+
+- **`iobtn <1|2|3> [command]`** — View or set the command for button 1 (P10), 2 (P11), or 3 (P12). Without `command`, prints the current command (or “(none)”). With `command`, saves it and runs it on the next press. Example: `iobtn 1 nfc read`.
+- **`settings get io_btn_p10_cmd`** / **`settings set io_btn_p10_cmd <value>`** — Same for P10; use `io_btn_p11_cmd` and `io_btn_p12_cmd` for P11 and P12.
+
+On press, the device switches to the terminal view and runs the command. To use a button as a normal joystick action instead, clear its command (e.g. `iobtn 1 ""` or `settings set io_btn_p10_cmd ""`).
+
+**On-device UI:** **Settings → IO Buttons** lets you edit each button’s command with the keyboard; the current command is pre-filled when editing.
 
 ## Infrared
 

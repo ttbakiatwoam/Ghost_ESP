@@ -46,6 +46,12 @@ idf.py menuconfig
 
 Use the menu to browse `GhostESP Options → GhostESP Features`. Save and exit when finished.
 
+### Enabling core dumps to flash
+
+GhostESP can capture ESP-IDF core dumps into a dedicated flash partition after a crash. When enabled, the device exposes a `coredump` CLI command (plus extra coredump status lines in `chipinfo`).
+
+In `idf.py menuconfig`, use the search function to find `ESP_COREDUMP_ENABLE_TO_FLASH` (or search for `COREDUMP`) and enable **core dump to flash**. Make sure your partition table includes a `data,coredump` partition.
+
 ### Enabling NFC features
 
 Open **Ghost ESP Options → NFC Options** to toggle the backends:
@@ -75,6 +81,8 @@ When **Enable Status Display** is enabled, you can configure:
 - **Rotate status display 180 degrees**: Optional rotation setting.
 
 The status display shows system information, attack status, and idle animations when configured. It's particularly useful for boards like the Heltec V3 which includes an onboard OLED display.
+
+On boards that use the IO expander, three buttons on the expander (P10, P11, P12) can be programmed to run CLI commands or act as joystick buttons. Configure them via **Settings → IO Buttons** on the device or the `iobtn` and `settings` commands; see the [CLI reference](/getting-started/command-line-reference/#io-expander-buttons-if-present).
 
 ### Configuring LVGL display driver
 

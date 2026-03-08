@@ -81,6 +81,9 @@ static const char *NVS_BADUSB_PROD_KEY = "bu_prod";
 static const char *NVS_BADUSB_RAND_KEY = "bu_rand";
 static const char *NVS_BADUSB_KB_KEY = "bu_kb_layout";
 #endif
+static const char *NVS_IO_BTN_P10_CMD_KEY = "io_btn_p10";
+static const char *NVS_IO_BTN_P11_CMD_KEY = "io_btn_p11";
+static const char *NVS_IO_BTN_P12_CMD_KEY = "io_btn_p12";
 
 
 static const char *TAG = "SettingsManager";
@@ -150,7 +153,7 @@ void settings_set_defaults(FSettings *settings) {
   strcpy(settings->selected_hex_accent_color, "#ffffff");
   strcpy(settings->selected_timezone, "MST7MDT,M3.2.0,M11.1.0");
   settings->gps_rx_pin = 0;
-  settings->display_timeout_ms = UINT32_MAX; // Default to never timeout
+  settings->display_timeout_ms = 30000; // Default to 30 seconds
   settings->rts_enabled = false;
   strcpy(settings->sta_ssid, ""); // Default empty station SSID
   strcpy(settings->sta_password, ""); // Default empty station password
@@ -187,6 +190,9 @@ void settings_set_defaults(FSettings *settings) {
   strcpy(settings->wigle_api_key, "");
   settings->wigle_auto_upload = false; // Default to off
   settings->wigle_donate = true; // Default to donating
+  settings->io_btn_p10_cmd[0] = '\0';
+  settings->io_btn_p11_cmd[0] = '\0';
+  settings->io_btn_p12_cmd[0] = '\0';
 #ifdef CONFIG_WITH_STATUS_DISPLAY
   settings->status_idle_animation = IDLE_ANIM_GAME_OF_LIFE;
   settings->status_idle_timeout_ms = 5000; // default 5s
@@ -356,7 +362,7 @@ void settings_load(FSettings *settings) {
   if (err == ESP_OK) {
     settings->display_timeout_ms = timeout_value;
   } else {
-    settings->display_timeout_ms = UINT32_MAX; // Default to never timeout if not found
+    settings->display_timeout_ms = 30000; // Default to 30 seconds if not found
   }
 
   uint8_t rtsenabledvalue;
@@ -417,6 +423,16 @@ void settings_load(FSettings *settings) {
     printf("Failed to load Wigle auto-upload setting: %s\n", esp_err_to_name(err));
   }
   settings->wigle_auto_upload = (auto_upload_val != 0);
+
+  str_size = sizeof(settings->io_btn_p10_cmd);
+  err = nvs_get_str(nvsHandle, NVS_IO_BTN_P10_CMD_KEY, settings->io_btn_p10_cmd, &str_size);
+  if (err != ESP_OK) settings->io_btn_p10_cmd[0] = '\0';
+  str_size = sizeof(settings->io_btn_p11_cmd);
+  err = nvs_get_str(nvsHandle, NVS_IO_BTN_P11_CMD_KEY, settings->io_btn_p11_cmd, &str_size);
+  if (err != ESP_OK) settings->io_btn_p11_cmd[0] = '\0';
+  str_size = sizeof(settings->io_btn_p12_cmd);
+  err = nvs_get_str(nvsHandle, NVS_IO_BTN_P12_CMD_KEY, settings->io_btn_p12_cmd, &str_size);
+  if (err != ESP_OK) settings->io_btn_p12_cmd[0] = '\0';
 
   printf("Settings loaded from NVS.\n");
   int32_t tmp;
@@ -803,6 +819,10 @@ void settings_persist_setting(SettingsType setting) {
 #endif
         case SETTING_RUN_SETUP_WIZARD:
         case SETTING_I2C_SCAN:
+        case SETTING_WIGLE_TEST_API:
+        case SETTING_WIGLE_HELP:
+        case SETTING_WIGLE_MANUAL_UPLOAD:
+        case SETTING_WIGLE_STATS:
              // Actions, not saved
              return;
         case SETTING_SETUP_COMPLETE:
@@ -835,6 +855,10 @@ void settings_persist_setting(SettingsType setting) {
             key = NVS_BADUSB_KB_KEY;
             break;
 #endif
+        case SETTING_WIGLE_API_KEY:
+            err = nvs_set_str(nvsHandle, NVS_WIGLE_API_KEY, G_Settings.wigle_api_key);
+            key = NVS_WIGLE_API_KEY;
+            break;
         case SETTING_WIGLE_AUTO_UPLOAD:
             err = nvs_set_u8(nvsHandle, NVS_WIGLE_AUTO_UPLOAD_KEY, G_Settings.wigle_auto_upload ? 1 : 0);
             key = NVS_WIGLE_AUTO_UPLOAD_KEY;
@@ -984,6 +1008,9 @@ void settings_save(const FSettings *settings) {
     nvs_set_str(nvsHandle, NVS_WIGLE_API_KEY, settings->wigle_api_key);
     nvs_set_u8(nvsHandle, NVS_WIGLE_DONATE_KEY, settings->wigle_donate ? 1 : 0);
     nvs_set_u8(nvsHandle, NVS_WIGLE_AUTO_UPLOAD_KEY, settings->wigle_auto_upload ? 1 : 0);
+    nvs_set_str(nvsHandle, NVS_IO_BTN_P10_CMD_KEY, settings->io_btn_p10_cmd);
+    nvs_set_str(nvsHandle, NVS_IO_BTN_P11_CMD_KEY, settings->io_btn_p11_cmd);
+    nvs_set_str(nvsHandle, NVS_IO_BTN_P12_CMD_KEY, settings->io_btn_p12_cmd);
     nvs_set_u8(nvsHandle, NVS_NEOPIXEL_MAX_BRIGHTNESS_KEY, settings->neopixel_max_brightness);
     nvs_set_u8(nvsHandle, NVS_ENCODER_INVERT_KEY, settings->encoder_invert_direction ? 1 : 0);
     nvs_set_u8(nvsHandle, NVS_SETUP_COMPLETE_KEY, settings->setup_complete ? 1 : 0);
@@ -1455,6 +1482,31 @@ void settings_set_wigle_donate(FSettings *settings, bool enabled) {
 
 bool settings_get_wigle_donate(const FSettings *settings) {
   return settings->wigle_donate;
+}
+
+const char *settings_get_io_btn_p10_cmd(const FSettings *settings) {
+  return settings ? settings->io_btn_p10_cmd : "";
+}
+void settings_set_io_btn_p10_cmd(FSettings *settings, const char *cmd) {
+  if (!settings || !cmd) return;
+  strncpy(settings->io_btn_p10_cmd, cmd, sizeof(settings->io_btn_p10_cmd) - 1);
+  settings->io_btn_p10_cmd[sizeof(settings->io_btn_p10_cmd) - 1] = '\0';
+}
+const char *settings_get_io_btn_p11_cmd(const FSettings *settings) {
+  return settings ? settings->io_btn_p11_cmd : "";
+}
+void settings_set_io_btn_p11_cmd(FSettings *settings, const char *cmd) {
+  if (!settings || !cmd) return;
+  strncpy(settings->io_btn_p11_cmd, cmd, sizeof(settings->io_btn_p11_cmd) - 1);
+  settings->io_btn_p11_cmd[sizeof(settings->io_btn_p11_cmd) - 1] = '\0';
+}
+const char *settings_get_io_btn_p12_cmd(const FSettings *settings) {
+  return settings ? settings->io_btn_p12_cmd : "";
+}
+void settings_set_io_btn_p12_cmd(FSettings *settings, const char *cmd) {
+  if (!settings || !cmd) return;
+  strncpy(settings->io_btn_p12_cmd, cmd, sizeof(settings->io_btn_p12_cmd) - 1);
+  settings->io_btn_p12_cmd[sizeof(settings->io_btn_p12_cmd) - 1] = '\0';
 }
 
 #ifdef CONFIG_WITH_STATUS_DISPLAY

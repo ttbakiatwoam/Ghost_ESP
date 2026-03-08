@@ -51,7 +51,7 @@ file(GLOB_RECURSE axs15231b_sources "${CMAKE_SOURCE_DIR}/components/axs15231b/*.
 
 list(APPEND app_sources ${axs15231b_sources} ${image_sources})
 
-set(required_components bt nvs_flash driver esp_http_server mdns json esp_http_client mbedtls fatfs sdmmc wpa_supplicant lvgl lvgl_esp32_drivers freertos esp_lcd esp_adc esp_timer io_manager usb esp_eth rm67162_qspi cst816t)
+set(required_components bt nvs_flash driver esp_http_server mdns json esp_http_client mbedtls fatfs sdmmc wpa_supplicant lvgl lvgl_esp32_drivers freertos esp_lcd esp_adc esp_timer io_manager usb esp_eth rm67162_qspi cst816t espcoredump)
 
 # Optionally add extra include directories
 set(extra_includes "")

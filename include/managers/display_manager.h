@@ -28,7 +28,10 @@ typedef enum {
 typedef struct {
   InputType type;
   union {
-    int joystick_index;         // Used for joystick inputs
+    struct {
+      int joystick_index;
+      bool joystick_pressed;
+    };
     lv_indev_data_t touch_data; // Used for touchscreen inputs
     uint8_t key_value;          // Used for keyboard inputs
     struct { int8_t direction; bool button; } encoder; // Added for encoder input

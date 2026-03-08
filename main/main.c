@@ -1,4 +1,5 @@
 #include "core/commandline.h"
+#include "core/callbacks.h"
 #include "core/serial_manager.h"
 #include "core/system_manager.h"
 #include "core/ghostesp_version.h"
@@ -24,6 +25,13 @@
 #include "driver/gpio.h"
 #include "esp_heap_caps.h"
 #include "managers/usb_keyboard_manager.h"
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+#include "esp_partition.h"
+#endif
 
 #ifdef CONFIG_WITH_ETHERNET
 #include "managers/ethernet_manager.h"
@@ -35,6 +43,9 @@
 
 #ifdef CONFIG_WITH_SCREEN
 #include "managers/views/splash_screen.h"
+#if defined(CONFIG_HAS_NRF24) || defined(CONFIG_HAS_NRF24_REMOTE)
+#include "managers/views/nrf24_analyzer_view.h"
+#endif
 #endif
 #ifdef CONFIG_WITH_STATUS_DISPLAY
 #include "managers/status_display_manager.h"
@@ -53,6 +64,240 @@ RGBManager_t rgb_manager;  // Global instance for entire project
 
 int ieee80211_raw_frame_sanity_check(int32_t arg, int32_t arg2, int32_t arg3) { return 0; }
 static const char *TAG = "Main.c";
+
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+#define COREDUMP_ROOT_DIR "/mnt/ghostesp"
+#define COREDUMP_LOGS_DIR "/mnt/ghostesp/logs"
+#define COREDUMP_SD_DIR "/mnt/ghostesp/logs/coredumps"
+#define COREDUMP_SIG_PATH "/mnt/ghostesp/logs/coredumps/.last_saved_sig"
+
+#ifndef COREDUMP_AUTOSAVE_ERASE_AFTER_SAVE
+/* Set to 0 to keep coredump data in flash after autosave. */
+#define COREDUMP_AUTOSAVE_ERASE_AFTER_SAVE 1
+#endif
+
+static uint32_t coredump_fnv1a_update(uint32_t hash, const uint8_t *data, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        hash ^= data[i];
+        hash *= 16777619u;
+    }
+    return hash;
+}
+
+static bool coredump_read_saved_sig(char *out, size_t out_len) {
+    if (!out || out_len == 0) {
+        return false;
+    }
+
+    FILE *f = fopen(COREDUMP_SIG_PATH, "rb");
+    if (!f) {
+        return false;
+    }
+
+    size_t n = fread(out, 1, out_len - 1, f);
+    fclose(f);
+    if (n == 0) {
+        out[0] = '\0';
+        return false;
+    }
+
+    out[n] = '\0';
+    char *nl = strchr(out, '\n');
+    if (nl) {
+        *nl = '\0';
+    }
+    return true;
+}
+
+static void coredump_write_saved_sig(const char *sig) {
+    FILE *f = fopen(COREDUMP_SIG_PATH, "wb");
+    if (!f) {
+        ESP_LOGW(TAG, "Failed to write coredump signature marker");
+        return;
+    }
+    fwrite(sig, 1, strlen(sig), f);
+    fwrite("\n", 1, 1, f);
+    fclose(f);
+}
+
+static bool coredump_detect_present_and_sig(const esp_partition_t *part, int *elf_offset_out, uint32_t *sig_out) {
+    uint8_t head[256];
+    size_t head_len = part->size < sizeof(head) ? (size_t)part->size : sizeof(head);
+    if (esp_partition_read(part, 0, head, head_len) != ESP_OK) {
+        return false;
+    }
+
+    int empty = 1;
+    int elf_offset = -1;
+    for (size_t i = 0; i < head_len; i++) {
+        if (head[i] != 0xff) {
+            empty = 0;
+        }
+        if (elf_offset < 0 && i + 4 <= head_len &&
+            head[i] == 0x7f && head[i + 1] == 'E' && head[i + 2] == 'L' && head[i + 3] == 'F') {
+            elf_offset = (int)i;
+        }
+    }
+    if (empty != 0) {
+        return false;
+    }
+
+    uint32_t hash = 2166136261u;
+    hash = coredump_fnv1a_update(hash, (const uint8_t *)&part->size, sizeof(part->size));
+    hash = coredump_fnv1a_update(hash, head, head_len);
+
+    if (elf_offset_out) {
+        *elf_offset_out = elf_offset;
+    }
+    if (sig_out) {
+        *sig_out = hash;
+    }
+    return true;
+}
+
+static esp_err_t coredump_save_partition_bin(const esp_partition_t *part, const char *path, size_t *written_out) {
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        return ESP_FAIL;
+    }
+
+    uint8_t buf[512];
+    size_t offset = 0;
+    while (offset < part->size) {
+        size_t chunk = (part->size - offset) > sizeof(buf) ? sizeof(buf) : (part->size - offset);
+        esp_err_t err = esp_partition_read(part, offset, buf, chunk);
+        if (err != ESP_OK) {
+            fclose(f);
+            return err;
+        }
+        if (fwrite(buf, 1, chunk, f) != chunk) {
+            fclose(f);
+            return ESP_FAIL;
+        }
+        offset += chunk;
+    }
+
+    fclose(f);
+    if (written_out) {
+        *written_out = offset;
+    }
+    return ESP_OK;
+}
+
+static esp_err_t coredump_erase_partition(const esp_partition_t *part) {
+    size_t erase_size = part->erase_size;
+    if (erase_size == 0) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+    size_t to_erase = (part->size / erase_size) * erase_size;
+    if (to_erase == 0) {
+        to_erase = erase_size;
+    }
+    return esp_partition_erase_range(part, 0, to_erase);
+}
+
+static void coredump_write_summary(const char *summary_path, const char *bin_path,
+                                   const esp_partition_t *part, int elf_offset,
+                                   const char *panic_reason) {
+    FILE *f = fopen(summary_path, "wb");
+    if (!f) {
+        ESP_LOGW(TAG, "Failed to create coredump summary: %s", summary_path);
+        return;
+    }
+
+    fprintf(f, "coredump_file=%s\n", bin_path);
+    fprintf(f, "partition_label=%s\n", part->label);
+    fprintf(f, "partition_size=%u\n", (unsigned)part->size);
+    fprintf(f, "format=%s\n", (elf_offset >= 0) ? "elf" : "binary");
+    if (elf_offset > 0) {
+        fprintf(f, "elf_offset=%d\n", elf_offset);
+    }
+    fprintf(f, "panic_reason=%s\n", panic_reason && panic_reason[0] ? panic_reason : "not_available");
+    fprintf(f, "decode_hint=idf.py coredump-info -c <file>\n");
+    fclose(f);
+}
+
+static void coredump_autosave_on_boot(void) {
+    const esp_partition_t *part = esp_partition_find_first(
+        ESP_PARTITION_TYPE_DATA,
+        ESP_PARTITION_SUBTYPE_DATA_COREDUMP,
+        NULL);
+    if (!part) {
+        return;
+    }
+
+    int elf_offset = -1;
+    uint32_t sig = 0;
+    if (!coredump_detect_present_and_sig(part, &elf_offset, &sig)) {
+        return;
+    }
+
+    bool display_was_suspended = false;
+    bool did_jit_mount = false;
+    if (!sd_card_manager.is_initialized) {
+        if (sd_card_mount_for_flush(&display_was_suspended) != ESP_OK) {
+            ESP_LOGW(TAG, "Coredump present but SD unavailable for autosave");
+            return;
+        }
+        did_jit_mount = true;
+    }
+
+    if (!sd_card_exists(COREDUMP_ROOT_DIR) && sd_card_create_directory(COREDUMP_ROOT_DIR) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to ensure root dir for coredump autosave");
+        goto cleanup;
+    }
+    if (!sd_card_exists(COREDUMP_LOGS_DIR) && sd_card_create_directory(COREDUMP_LOGS_DIR) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to ensure logs dir for coredump autosave");
+        goto cleanup;
+    }
+    if (!sd_card_exists(COREDUMP_SD_DIR) && sd_card_create_directory(COREDUMP_SD_DIR) != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to ensure coredump dir for autosave");
+        goto cleanup;
+    }
+
+    char sig_id[40];
+    snprintf(sig_id, sizeof(sig_id), "%08lx_%u", (unsigned long)sig, (unsigned)part->size);
+
+    char previous_sig[40];
+    if (coredump_read_saved_sig(previous_sig, sizeof(previous_sig)) && strcmp(previous_sig, sig_id) == 0) {
+        ESP_LOGI(TAG, "Coredump already saved: %s", sig_id);
+        goto cleanup;
+    }
+
+    char bin_path[192];
+    char summary_path[192];
+    snprintf(bin_path, sizeof(bin_path), COREDUMP_SD_DIR "/coredump_%s.bin", sig_id);
+    snprintf(summary_path, sizeof(summary_path), COREDUMP_SD_DIR "/coredump_%s.summary.txt", sig_id);
+
+    size_t bytes_written = 0;
+    esp_err_t save_err = coredump_save_partition_bin(part, bin_path, &bytes_written);
+    if (save_err != ESP_OK) {
+        ESP_LOGW(TAG, "Coredump autosave failed: %s", esp_err_to_name(save_err));
+        goto cleanup;
+    }
+
+    const char *panic_reason = "run idf.py coredump-info for decoded panic reason";
+
+    coredump_write_summary(summary_path, bin_path, part, elf_offset, panic_reason);
+    coredump_write_saved_sig(sig_id);
+    ESP_LOGI(TAG, "Coredump autosaved (%u bytes): %s", (unsigned)bytes_written, bin_path);
+
+#if COREDUMP_AUTOSAVE_ERASE_AFTER_SAVE
+    esp_err_t erase_err = coredump_erase_partition(part);
+    if (erase_err == ESP_OK) {
+        ESP_LOGI(TAG, "Erased coredump partition after autosave");
+    } else {
+        ESP_LOGW(TAG, "Failed to erase coredump after autosave: %s", esp_err_to_name(erase_err));
+    }
+#endif
+
+cleanup:
+    if (did_jit_mount) {
+        sd_card_unmount_after_flush(display_was_suspended);
+    }
+}
+#endif
+
 void app_main(void) {
     // Reduce NimBLE log verbosity (keep warnings/errors only)
     esp_log_level_set("NimBLE", ESP_LOG_WARN);
@@ -205,9 +450,13 @@ void app_main(void) {
         int32_t comm_rx = G_Settings.esp_comm_rx_pin;
         MEASURE_INIT_RAM("Comm Manager", esp_comm_manager_init((gpio_num_t)comm_tx, (gpio_num_t)comm_rx, DEFAULT_BAUD_RATE));
     }
+    wardriving_register_stream_handler();
     usb_keyboard_manager_register_stream_handler();
 #ifdef CONFIG_HAS_BADUSB
     badusb_manager_register_stream_handler();
+#endif
+#if defined(CONFIG_WITH_SCREEN) && (defined(CONFIG_HAS_NRF24) || defined(CONFIG_HAS_NRF24_REMOTE))
+    nrf24_analyzer_register_stream_handler();
 #endif
 
     ESP_LOGI(TAG, "Initializing AP Manager");
@@ -265,13 +514,17 @@ void app_main(void) {
     esp_err_t err = 0;
     MEASURE_INIT_RAM("SD Card init", err = sd_card_init());
 
+#if CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH
+    coredump_autosave_on_boot();
+#endif
+
     // Initialize RGB Manager based on persisted settings or compile-time defaults
     {
         bool initialized = false;
         int32_t data_pin = settings_get_rgb_data_pin(&G_Settings);
         int rgb_led_count = settings_get_rgb_led_count(&G_Settings);
         if (rgb_led_count <= 0) {
-            rgb_led_count = CONFIG_NUM_LEDS > 0 ? CONFIG_NUM_LEDS : 1;
+            rgb_led_count = CONFIG_NUM_LEDS;
         }
         int32_t red_pin, green_pin, blue_pin;
         settings_get_rgb_separate_pins(&G_Settings, &red_pin, &green_pin, &blue_pin);
@@ -286,17 +539,21 @@ void app_main(void) {
                                                  LED_MODEL_WS2812, red_pin, green_pin, blue_pin));
             initialized = (rgb_err == ESP_OK);
         }
-            if (!initialized) {
+            if (!initialized && rgb_led_count > 0) {
 #ifdef CONFIG_LED_DATA_PIN
+            if (CONFIG_LED_DATA_PIN >= 0) {
             esp_err_t rgb_err;
             MEASURE_INIT_RAM("RGB Manager (fallback) init", rgb_err = rgb_manager_init(&rgb_manager, CONFIG_LED_DATA_PIN, rgb_led_count, LED_ORDER,
                                                  LED_MODEL_WS2812, GPIO_NUM_NC, GPIO_NUM_NC, GPIO_NUM_NC));
             initialized = (rgb_err == ESP_OK);
+            }
 #elif defined(CONFIG_RED_RGB_PIN) && defined(CONFIG_GREEN_RGB_PIN) && defined(CONFIG_BLUE_RGB_PIN)
+            if (CONFIG_RED_RGB_PIN >= 0 && CONFIG_GREEN_RGB_PIN >= 0 && CONFIG_BLUE_RGB_PIN >= 0) {
             esp_err_t rgb_err;
             MEASURE_INIT_RAM("RGB Manager (fallback separate pins) init", rgb_err = rgb_manager_init(&rgb_manager, GPIO_NUM_NC, rgb_led_count, LED_PIXEL_FORMAT_GRB,
                                                  LED_MODEL_WS2812, CONFIG_RED_RGB_PIN, CONFIG_GREEN_RGB_PIN, CONFIG_BLUE_RGB_PIN));
             initialized = (rgb_err == ESP_OK);
+            }
 #endif
         }
         RGBMode boot_mode = settings_get_rgb_mode(&G_Settings);

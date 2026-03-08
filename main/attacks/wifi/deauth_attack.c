@@ -18,6 +18,7 @@
 #include "managers/status_display_manager.h"
 #include "managers/views/terminal_screen.h"
 #include "core/glog.h"
+#include "scans/wifi/station_scan.h"
 #include "scans/wifi/wifi_channels.h"
 #include "esp_wifi.h"
 #include "esp_random.h"
@@ -393,7 +394,14 @@ void deauth_attack_start(void) {
         }
         
         deauth_stop_requested = false;
-        xTaskCreate(deauth_task, "deauth_task", 4096, NULL, 5, &deauth_task_handle);
+        BaseType_t rc = xTaskCreate(deauth_task, "deauth_task", 4096, NULL, 5, &deauth_task_handle);
+        if (rc != pdPASS) {
+            glog("Failed to start deauth task (%ld)\n", (long)rc);
+            status_display_show_status("Deauth Start Fail");
+            deauth_task_handle = NULL;
+            deauth_stop_requested = false;
+            return;
+        }
         deauth_task_running = true;
         rgb_manager_set_color(&rgb_manager, -1, 255, 0, 0, false);
     } else {
@@ -435,7 +443,9 @@ void deauth_attack_stop(void) {
 }
 
 void deauth_attack_start_station(void) {
+    station_selected_local = station_scan_get_selection(&selected_station_local);
     if (!station_selected_local) {
+        glog("No station selected; falling back to AP deauth mode.\n");
         deauth_attack_start();
         return;
     }
@@ -475,7 +485,15 @@ void deauth_attack_start_station(void) {
          selected_station_local.ap_bssid[0], selected_station_local.ap_bssid[1], selected_station_local.ap_bssid[2], 
          selected_station_local.ap_bssid[3], selected_station_local.ap_bssid[4], selected_station_local.ap_bssid[5]);
     deauth_station_stop_requested = false;
-    xTaskCreate(deauth_station_task, "deauth_station", 4096, NULL, 5, &deauth_station_task_handle);
+    BaseType_t station_rc = xTaskCreate(deauth_station_task, "deauth_station", 4096, NULL, 5, &deauth_station_task_handle);
+    if (station_rc != pdPASS) {
+        glog("Failed to start station deauth task (%ld)\n", (long)station_rc);
+        status_display_show_status("Deauth Station Fail");
+        deauth_station_task_handle = NULL;
+        deauth_station_stop_requested = false;
+        ap_manager_start_services();
+        return;
+    }
     station_selected_local = false;
 }
 
