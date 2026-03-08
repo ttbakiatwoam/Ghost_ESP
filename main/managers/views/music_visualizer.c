@@ -9,7 +9,6 @@
 #include "gui/screen_layout.h"
 #include "gui/lvgl_safe.h"
 
-#define NUM_PARTICLES 5
 #define ANIMATION_INTERVAL_MS 5 // Approximately 30 FPS
 
 static const char *TAG = "MusicVisualizer";
@@ -17,17 +16,9 @@ static const char *TAG = "MusicVisualizer";
 lv_timer_t *animation_timer = NULL;
 
 typedef struct {
-  lv_obj_t *obj;
-  int x;        // Current x position
-  int y;        // Current y position
-  int velocity; // Horizontal velocity
-} Particle;
-
-typedef struct {
   int bars[NUM_BARS]; // Amplitude data for each bar
 } AmplitudeData;
 
-Particle particles[NUM_PARTICLES];
 MusicVisualizerView view;
 lv_obj_t *root;
 QueueHandle_t amplitudeQueue;
@@ -141,23 +132,6 @@ void music_visualizer_view_create() {
     lv_obj_set_style_bg_grad_dir(view.bars[i], LV_GRAD_DIR_VER, LV_PART_MAIN);
   }
 
-  int content_h = LV_VER_RES - GUI_STATUS_BAR_HEIGHT;
-  for (int i = 0; i < NUM_PARTICLES; i++) {
-    particles[i].obj = lv_obj_create(content);
-    lv_obj_remove_style_all(particles[i].obj);
-    lv_obj_clear_flag(particles[i].obj, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_set_size(particles[i].obj, 2, 2);
-    lv_obj_set_style_radius(particles[i].obj, LV_RADIUS_CIRCLE, LV_PART_MAIN);
-    lv_obj_set_style_bg_opa(particles[i].obj, LV_OPA_COVER, LV_PART_MAIN);
-    lv_obj_set_style_bg_color(particles[i].obj, lv_color_white(), LV_PART_MAIN);
-
-    particles[i].x = 0;
-    particles[i].y = rand() % content_h;
-    particles[i].velocity = 1 + rand() % 3;
-    lv_obj_align(particles[i].obj, LV_ALIGN_TOP_LEFT, particles[i].x,
-                 particles[i].y);
-  }
-
   amplitudeQueue = xQueueCreate(10, sizeof(AmplitudeData));
   animation_timer =
       lv_timer_create(animation_timer_callback, ANIMATION_INTERVAL_MS, NULL);
@@ -198,16 +172,7 @@ static void animation_timer_callback(lv_timer_t *timer) {
     lv_obj_set_height(view.bars[i], current_amplitudes[i]);
   }
 
-  int content_h = LV_VER_RES - GUI_STATUS_BAR_HEIGHT;
-  for (int i = 0; i < NUM_PARTICLES; i++) {
-    particles[i].x += particles[i].velocity;
-    if (particles[i].x > LV_HOR_RES) {
-      particles[i].x = 0;
-      particles[i].y = rand() % content_h;
-      particles[i].velocity = 1 + rand() % 3;
-    }
-    lv_obj_set_pos(particles[i].obj, particles[i].x, particles[i].y);
-  }
+
 }
 
 void music_visualizer_view_update(const uint8_t *amplitudes,

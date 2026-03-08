@@ -175,6 +175,7 @@ static void imu_orientation_task(void *pvParameters) {
     const int DEBOUNCE_REQUIRED = 3;
     int pending_orientation = s_imu_orientation;
     int debounce_count = 0;
+    bool first_read = true;
 
     while (1) {
         float ax, ay, az;
@@ -183,14 +184,23 @@ static void imu_orientation_task(void *pvParameters) {
             continue;
         }
 
+        if (first_read) {
+            ESP_LOGI(IMU_TAG, "Initial accel: ax=%.3f ay=%.3f az=%.3f", ax, ay, az);
+            first_read = false;
+        }
+
         int orientation = s_imu_orientation; // default: keep current
         float abs_x = fabsf(ax);
         float abs_y = fabsf(ay);
 
+        // QMI8658 chip X axis aligns with device vertical (portrait axis),
+        // Y axis aligns with device horizontal (landscape axis).
         if (abs_x > abs_y + THRESHOLD) {
-            orientation = (ax > 0) ? 1 : 3;
+            // X dominant → portrait / inverted-portrait
+            orientation = (ax > 0) ? 0 : 2;
         } else if (abs_y > abs_x + THRESHOLD) {
-            orientation = (ay > 0) ? 2 : 0;
+            // Y dominant → landscape-right / landscape-left
+            orientation = (ay > 0) ? 3 : 1;
         }
 
         if (orientation != s_imu_orientation) {
@@ -1014,12 +1024,26 @@ static void set_rotation_on_lvgl(void *param) {
   if (old_rot == rot) return; /* nothing to do */
 
 #ifdef CONFIG_USE_WAVESHARE_AMOLED
-  /* Hardware rotation via panel MADCTL — update the panel first, then inform
-   * LVGL about the new logical dimensions.  sw_rotate is disabled so LVGL
-   * renders directly in the rotated coordinate space and the panel controller
-   * handles the physical pixel mapping. */
-  esp_lcd_panel_rm67162_set_rotation(s_amoled_panel, rotation);
+  /* Clear the entire physical panel GRAM to black before changing
+   * rotation.  LVGL's virtual area may not cover every physical pixel
+   * in the new orientation, leaving stale content visible as "saw-tooth"
+   * artefacts at the screen edges. */
+  if (s_amoled_panel) {
+    const int BLK_LINES = 32;
+    size_t blk_sz = CONFIG_TFT_WIDTH * BLK_LINES * sizeof(lv_color_t);
+    void *blk = heap_caps_calloc(1, blk_sz, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (blk) {
+      for (int y = 0; y < CONFIG_TFT_HEIGHT; y += BLK_LINES) {
+        int ye = y + BLK_LINES;
+        if (ye > CONFIG_TFT_HEIGHT) ye = CONFIG_TFT_HEIGHT;
+        esp_lcd_panel_draw_bitmap(s_amoled_panel, 0, y,
+                                  CONFIG_TFT_WIDTH, ye, blk);
+      }
+      heap_caps_free(blk);
+    }
+  }
 #endif
+
   lv_disp_set_rotation(disp, rot);
 
   /* Always resize the status bar to the (possibly new) screen width. */
@@ -1041,6 +1065,10 @@ static void set_rotation_on_lvgl(void *param) {
       v->get_hardwareinput_callback((void **)&dm.current_view->input_callback);
     }
   }
+
+  /* Force a full-screen redraw so the panel GRAM has no stale pixels
+   * from the previous orientation (avoids saw-tooth artefacts at edges). */
+  lv_obj_invalidate(lv_scr_act());
 
   ESP_LOGI(TAG, "Display rotation set to %d° — view rebuilt",
            rotation * 90);
@@ -1774,10 +1802,10 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
     disp_drv.ver_res = CONFIG_TFT_HEIGHT;
     disp_drv.flush_cb = invert_flush_cb;
     disp_drv.draw_buf = &disp_buf;
-    disp_drv.sw_rotate = 0;   // Hardware rotation via panel MADCTL
+    disp_drv.sw_rotate = 1;   // LVGL software rotation (panel MADCTL stays 0x00)
     disp_drv.rotated = LV_DISP_ROT_NONE;  // Start in native portrait
     lv_disp_drv_register(&disp_drv);
-    ESP_LOGI(TAG, "LVGL display registered (%dx%d, PSRAM double-buf %d lines, hw_rotate)",
+    ESP_LOGI(TAG, "LVGL display registered (%dx%d, PSRAM double-buf %d lines, sw_rotate)",
              CONFIG_TFT_WIDTH, CONFIG_TFT_HEIGHT, ws_buf_lines);
   }
 
