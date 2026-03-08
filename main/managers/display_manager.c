@@ -260,6 +260,19 @@ static void imu_auto_rotation_stop(void) {
     ESP_LOGI(IMU_TAG, "IMU auto-rotation stopped");
 }
 
+/**
+ * SH8601 requires all CASET/RASET coordinates to be divisible by 2.
+ * This rounder callback ensures LVGL renders areas with even boundaries
+ * so that the physical coordinates after sw_rotate stay even-aligned.
+ */
+static void waveshare_amoled_rounder_cb(lv_disp_drv_t *drv, lv_area_t *area) {
+    (void)drv;
+    area->x1 = (area->x1 >> 1) << 1;          /* round start down to even */
+    area->y1 = (area->y1 >> 1) << 1;
+    area->x2 = ((area->x2 >> 1) << 1) + 1;    /* round end up to odd (so +1 is even) */
+    area->y2 = ((area->y2 >> 1) << 1) + 1;
+}
+
 static void waveshare_amoled_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                                       lv_color_t *color_p) {
     esp_lcd_panel_draw_bitmap(s_amoled_panel,
@@ -1793,6 +1806,7 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
     disp_drv.ver_res = CONFIG_TFT_HEIGHT;
     disp_drv.flush_cb = invert_flush_cb;
     disp_drv.draw_buf = &disp_buf;
+    disp_drv.rounder_cb = waveshare_amoled_rounder_cb;  // SH8601 needs even-aligned coords
     disp_drv.sw_rotate = 1;   // LVGL software rotation (panel MADCTL stays 0x00)
     disp_drv.rotated = LV_DISP_ROT_NONE;  // Start in native portrait
     lv_disp_drv_register(&disp_drv);
