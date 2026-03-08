@@ -852,6 +852,13 @@ void badusb_view_input_cb(InputEvent *event) {
                 badusb_cancel_cb(NULL);
                 return;
             }
+        } else if (event->type == INPUT_TYPE_TOUCH) {
+            /* Any tap on screen cancels the running popup */
+            lv_indev_data_t *data = &event->data.touch_data;
+            if (data->state == LV_INDEV_STATE_REL) {
+                badusb_cancel_cb(NULL);
+            }
+            return;
         }
         return;
     }
