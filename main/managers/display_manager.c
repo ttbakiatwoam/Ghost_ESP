@@ -173,6 +173,13 @@ static esp_lcd_panel_handle_t s_amoled_panel = NULL;
 static void *s_amoled_qspi_ctx = NULL;
 static cst816t_handle_t s_amoled_touch = NULL;
 
+/* Full-frame PSRAM buffer for 90°/270° landscape rotation.
+ * LVGL sw_rotate sends narrow vertical strips whose CASET boundaries
+ * violate the SH8601 even-alignment requirement.  We accumulate every
+ * strip here and push the whole frame on flushing_last, so the panel
+ * always sees CASET(0, 367) / RASET(0, 447). */
+static lv_color_t *s_landscape_fb = NULL;
+
 // QMI8658 IMU auto-rotation state
 static TaskHandle_t s_imu_task_handle = NULL;
 static volatile int s_imu_orientation = 0; // 0=portrait, 1=land-R, 2=inverted, 3=land-L
@@ -244,12 +251,12 @@ static void imu_orientation_task(void *pvParameters) {
 static void imu_auto_rotation_start(void) {
     if (s_imu_task_handle != NULL) return; // already running
     if (!qmi8658_is_ready()) {
-        ESP_LOGW(IMU_TAG, "QMI8658 not ready — cannot start auto-rotation");
+        ESP_LOGE(IMU_TAG, "QMI8658 not ready — cannot start auto-rotation");
         return;
     }
     xTaskCreatePinnedToCore(imu_orientation_task, "imu_orient", 3072,
                             NULL, 5, &s_imu_task_handle, 0);
-    ESP_LOGI(IMU_TAG, "IMU auto-rotation started");
+    ESP_LOGI(IMU_TAG, "IMU auto-rotation task started");
 }
 
 /** Stop IMU auto-rotation (called when switching to a manual rotation). */
@@ -275,8 +282,43 @@ static void waveshare_amoled_rounder_cb(lv_disp_drv_t *drv, lv_area_t *area) {
 
 static void waveshare_amoled_flush_cb(lv_disp_drv_t *drv, const lv_area_t *area,
                                       lv_color_t *color_p) {
-    esp_lcd_panel_draw_bitmap(s_amoled_panel,
-        area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+    bool last = drv->draw_buf->flushing_last;
+
+    bool landscape = (drv->rotated == LV_DISP_ROT_90 ||
+                      drv->rotated == LV_DISP_ROT_270);
+
+    if (landscape && s_landscape_fb) {
+        /* Landscape: accumulate sw_rotate strips into the full-frame PSRAM
+         * buffer.  Coordinates from sw_rotate are already in physical panel
+         * space, so we memcpy each row into the correct position.  On the
+         * final flush of the render cycle we push the frame in horizontal
+         * strips (SH8601 QSPI may not handle a single 322KB transfer). */
+        int strip_w = area->x2 - area->x1 + 1;
+        int strip_h = area->y2 - area->y1 + 1;
+        for (int row = 0; row < strip_h; row++) {
+            memcpy(&s_landscape_fb[(area->y1 + row) * CONFIG_TFT_WIDTH + area->x1],
+                   &color_p[row * strip_w],
+                   strip_w * sizeof(lv_color_t));
+        }
+        if (last) {
+            /* Push fully-assembled frame in 32-line horizontal strips
+             * to stay within QSPI DMA transfer limits. */
+            const int BLK = 32;
+            for (int y = 0; y < CONFIG_TFT_HEIGHT; y += BLK) {
+                int ye = y + BLK;
+                if (ye > CONFIG_TFT_HEIGHT) ye = CONFIG_TFT_HEIGHT;
+                esp_lcd_panel_draw_bitmap(s_amoled_panel,
+                    0, y, CONFIG_TFT_WIDTH, ye,
+                    &s_landscape_fb[y * CONFIG_TFT_WIDTH]);
+            }
+        }
+    } else {
+        /* Portrait / 180°: direct passthrough — coordinates are already
+         * within the native 368×448 panel bounds. */
+        esp_lcd_panel_draw_bitmap(s_amoled_panel,
+            area->x1, area->y1, area->x2 + 1, area->y2 + 1, color_p);
+    }
+
     lv_disp_flush_ready(drv);
 }
 
@@ -1051,27 +1093,19 @@ static void set_rotation_on_lvgl(void *param) {
     lv_obj_set_width(status_bar, lv_disp_get_hor_res(disp));
   }
 
-  /* Rebuild the current view so it picks up the new screen dimensions.
-   * Views size their elements using lv_disp_get_hor/ver_res() at create
-   * time, so they must be destroyed and re-created after any rotation —
-   * not just when the aspect ratio flips. */
-  if (dm.current_view && dm.current_view->root) {
-    View *v = dm.current_view;
-    if (v->destroy) v->destroy();
-    dm.current_view = NULL;
-    if (v->create) v->create();
-    dm.current_view = v;
-    if (v->get_hardwareinput_callback) {
-      v->get_hardwareinput_callback((void **)&dm.current_view->input_callback);
-    }
+  /* Clear the landscape frame buffer so the first render cycle after
+   * rotation doesn't show stale pixels from a previous orientation. */
+#ifdef CONFIG_USE_WAVESHARE_AMOLED
+  if (s_landscape_fb) {
+    memset(s_landscape_fb, 0,
+           CONFIG_TFT_WIDTH * CONFIG_TFT_HEIGHT * sizeof(lv_color_t));
   }
+#endif
 
   /* Force a full-screen redraw so the panel GRAM has no stale pixels
    * from the previous orientation (avoids saw-tooth artefacts at edges). */
   lv_obj_invalidate(lv_scr_act());
 
-  ESP_LOGI(TAG, "Display rotation set to %d° — view rebuilt",
-           rotation * 90);
 }
 
 void display_manager_set_rotation(uint8_t rotation) {
@@ -1812,6 +1846,21 @@ ESP_LOGI(TAG, "T-Deck trackball ISRs registered");
     lv_disp_drv_register(&disp_drv);
     ESP_LOGI(TAG, "LVGL display registered (%dx%d, PSRAM double-buf %d lines, sw_rotate)",
              CONFIG_TFT_WIDTH, CONFIG_TFT_HEIGHT, ws_buf_lines);
+
+    /* Pre-allocate landscape frame buffer for 90°/270° rotation.
+     * ~322 KB of PSRAM — avoids narrow CASET strips that cause
+     * saw-tooth artefacts on the SH8601 controller. */
+    if (!s_landscape_fb) {
+      s_landscape_fb = (lv_color_t *)heap_caps_calloc(
+          CONFIG_TFT_WIDTH * CONFIG_TFT_HEIGHT, sizeof(lv_color_t),
+          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+      if (s_landscape_fb) {
+        ESP_LOGI(TAG, "Landscape frame buffer allocated (%d KB PSRAM)",
+                 (int)(CONFIG_TFT_WIDTH * CONFIG_TFT_HEIGHT * sizeof(lv_color_t) / 1024));
+      } else {
+        ESP_LOGW(TAG, "Landscape frame buffer alloc failed — 90/270° may have artefacts");
+      }
+    }
   }
 
 #elif defined(CONFIG_JC3248W535EN_LCD)
